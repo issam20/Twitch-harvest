@@ -1,0 +1,48 @@
+# Configuration globale du pipeline
+# Les seuils sont conservateurs au depart, a tuner en production
+
+detector:
+  # Fenetre glissante d'analyse du chat (secondes)
+  chat_window_seconds: 10
+
+  # Seuils de declenchement
+  # msg/s au-dessus duquel on considere un pic
+  chat_velocity_threshold: 5.0
+
+  # Ratio moyen des 60 dernieres secondes pour normaliser
+  baseline_window_seconds: 60
+
+  # Multiplicateur vs baseline pour declencher (ex: 3.0 = 3x plus rapide que d'hab)
+  velocity_multiplier: 3.0
+
+  # Densite d'emotes "laugh/hype" dans la fenetre (ratio messages contenant une emote)
+  emote_density_threshold: 0.35
+
+  # Score global minimum pour clipper (0-100)
+  min_viral_score: 60
+
+  # Cooldown entre deux clips (secondes)
+  cooldown_seconds: 60
+
+  # Emotes trackees par categorie
+  emotes:
+    laugh: [KEKW, OMEGALUL, LULW, LUL, PepeLaugh, ICANT, PEEPOLAUGH]
+    hype: [Pog, PogChamp, POGGERS, EZ, LETSGO, LETSGOO, WICKED]
+    shock: [WutFace, monkaS, Sadge, NOOO, WAYTOODANK]
+
+clipper:
+  # Duree du buffer video (secondes) - garde les N dernieres secondes
+  buffer_seconds: 120
+
+  # Taille d'un chunk de segmentation ffmpeg
+  segment_duration: 10
+
+  # Longueur des clips produits autour du peak
+  clip_pre_seconds: 15   # secondes avant le peak
+  clip_post_seconds: 15  # secondes apres le peak
+
+  # Qualite streamlink (best, 1080p, 720p, 480p)
+  stream_quality: "720p60,720p,best"
+
+orchestrator:
+  log_level: INFO

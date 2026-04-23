@@ -1,0 +1,21 @@
+# Config specifique a un streamer
+# Fichier: config/streamers/<login_twitch>.yaml
+
+login: "example_streamer"   # login Twitch (URL twitch.tv/<login>)
+display_name: "Example"
+language: "fr"
+
+# Zone webcam dans le flux (pour recadrage 9:16 phase 2)
+# Coordonnees en pourcentage du frame pour etre resolution-independant
+webcam_zone:
+  x_pct: 0.75     # coin haut-droit
+  y_pct: 0.70
+  w_pct: 0.24
+  h_pct: 0.28
+
+# Override des seuils globaux si besoin
+detector_overrides:
+  min_viral_score: 55   # plus permissif
+
+# Tags par defaut pour la publication (phase 3)
+default_tags: ["twitch", "clips", "gaming", "fr"]
