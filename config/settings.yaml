@@ -1,28 +1,39 @@
 # Configuration globale du pipeline
-# Les seuils sont conservateurs au depart, a tuner en production
 
 detector:
   # Fenetre glissante d'analyse du chat (secondes)
   chat_window_seconds: 10
 
-  # Seuils de declenchement
-  # msg/s au-dessus duquel on considere un pic
-  chat_velocity_threshold: 5.0
+  # --- Velocity Z-score (adaptatif) ---
+  # Historique pour calculer μ et σ de la velocity (5 minutes)
+  # Plus c'est long, plus la calibration est précise mais plus le warmup est long
+  stats_window_seconds: 300
 
-  # Ratio moyen des 60 dernieres secondes pour normaliser
+  # Seuil Z-score pour déclencher (Z = nb d'écarts-types au-dessus de μ)
+  # Z=2.5 ≈ top 0.6% des moments → sélectif ; Z=2.0 ≈ top 2.3% → plus permissif
+  # Augmenter pour les gros streamers si encore trop de clips (ex: 3.0)
+  z_score_threshold: 2.5
+
+  # Velocity minimale absolue (msg/s) — sécurité anti-bruit sur petits chats
+  velocity_floor: 0.3
+
+  # Nombre de ticks (1 tick ≈ 2 s) avant d'activer le scoring velocity
+  # 30 ticks = ~60 s de chauffe pour établir μ/σ de base
+  warmup_samples: 30
+
+  # --- Autres seuils ---
+  # Fenêtre baseline pour unique chatters (secondes)
   baseline_window_seconds: 60
-
-  # Multiplicateur vs baseline pour declencher (ex: 3.0 = 3x plus rapide que d'hab)
-  velocity_multiplier: 3.0
 
   # Densite d'emotes "laugh/hype" dans la fenetre (ratio messages contenant une emote)
   emote_density_threshold: 0.35
 
-  # Score global minimum pour clipper (0-100)
-  min_viral_score: 60
+  # Score composite minimum (0-100) pour créer un clip
+  # Augmenter pour être plus sélectif (ex: 70 pour les gros streamers)
+  min_viral_score: 60.0
 
   # Cooldown entre deux clips (secondes)
-  cooldown_seconds: 60
+  cooldown_seconds: 120
 
   # Emotes trackees par categorie
   emotes:
@@ -31,17 +42,10 @@ detector:
     shock: [WutFace, monkaS, Sadge, NOOO, WAYTOODANK]
 
 clipper:
-  # Duree du buffer video (secondes) - garde les N dernieres secondes
   buffer_seconds: 120
-
-  # Taille d'un chunk de segmentation ffmpeg
   segment_duration: 10
-
-  # Longueur des clips produits autour du peak
-  clip_pre_seconds: 15   # secondes avant le peak
-  clip_post_seconds: 15  # secondes apres le peak
-
-  # Qualite streamlink (best, 1080p, 720p, 480p)
+  clip_pre_seconds: 15
+  clip_post_seconds: 15
   stream_quality: "720p60,720p,best"
 
 orchestrator:

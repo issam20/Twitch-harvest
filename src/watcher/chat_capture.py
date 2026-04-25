@@ -1,6 +1,8 @@
-"""Capture du chat Twitch IRC via twitchio.
+"""Capture du chat Twitch via connexion IRC directe (asyncio TCP).
 
-Emet des ChatEvent dans la queue pour le Detector.
+Remplace l'ancienne implémentation twitchio (incompatible v3.x).
+Protocole IRC Twitch standard — aucune dépendance externe.
+Se reconnecte automatiquement si la connexion est perdue.
 """
 from __future__ import annotations
 
@@ -8,69 +10,18 @@ import asyncio
 import re
 from datetime import datetime, timezone
 
-from twitchio.ext import commands
 from ..core.events import ChatEvent
 from ..core.logging import logger
 
-
-# Detection simple d'emotes: mots en majuscules style KEKW, PogChamp, etc.
-# Twitch envoie les emotes dans les tags IRC mais la liste officielle par stream
-# est complexe. On se contente d'une detection textuelle pour le MVP (la plupart
-# des emotes BTTV/FFZ/7TV apparaissent comme du texte dans le message).
+_IRC_HOST = "irc.chat.twitch.tv"
+_IRC_PORT = 6667
+_PRIVMSG_RE = re.compile(r"^:(\w+)!\w+@\w+\.tmi\.twitch\.tv PRIVMSG #\w+ :(.+)$")
 _EMOTE_TOKEN_RE = re.compile(r"\b([A-Z][A-Za-z0-9]{2,19})\b")
 
 
 def extract_emote_tokens(message: str, known_emotes: set[str]) -> list[str]:
-    """Retourne les emotes connues presentes dans le message."""
-    candidates = _EMOTE_TOKEN_RE.findall(message)
-    return [c for c in candidates if c in known_emotes]
-
-
-class ChatBot(commands.Bot):
-    """Client IRC Twitch qui pousse chaque message dans une queue."""
-
-    def __init__(
-        self,
-        token: str,
-        nick: str,
-        channel: str,
-        queue: asyncio.Queue[ChatEvent],
-        known_emotes: set[str],
-    ):
-        super().__init__(
-            token=token,
-            prefix="!",
-            initial_channels=[channel],
-            nick=nick,
-        )
-        self._channel = channel
-        self._queue = queue
-        self._known_emotes = known_emotes
-
-    async def event_ready(self):
-        logger.info(f"[chat] connecte comme {self.nick} sur #{self._channel}")
-
-    async def event_message(self, message):
-        # Ignore messages du bot lui-meme
-        if message.echo:
-            return
-        if message.author is None:
-            return
-
-        content = message.content or ""
-        emotes = extract_emote_tokens(content, self._known_emotes)
-
-        event = ChatEvent(
-            timestamp=datetime.now(timezone.utc),
-            channel=self._channel,
-            author=message.author.name,
-            content=content,
-            emotes=emotes,
-        )
-        try:
-            self._queue.put_nowait(event)
-        except asyncio.QueueFull:
-            logger.warning("[chat] queue pleine, message drop")
+    """Retourne les emotes connues présentes dans le message."""
+    return [c for c in _EMOTE_TOKEN_RE.findall(message) if c in known_emotes]
 
 
 async def run_chat_capture(
@@ -80,10 +31,83 @@ async def run_chat_capture(
     queue: asyncio.Queue[ChatEvent],
     known_emotes: set[str],
 ) -> None:
-    """Lance le bot IRC. A executer dans une task asyncio."""
-    bot = ChatBot(token=token, nick=nick, channel=channel, queue=queue, known_emotes=known_emotes)
+    """Lance la lecture IRC. Se reconnecte automatiquement sur déconnexion."""
+    while True:
+        try:
+            await _irc_session(token, nick, channel, queue, known_emotes)
+        except asyncio.CancelledError:
+            raise
+        except ConnectionError as exc:
+            # Token invalide ou nick introuvable → inutile de retry
+            logger.error(f"[chat] {exc}")
+            raise
+        except Exception as exc:
+            logger.warning(f"[chat] connexion perdue ({exc!r}), reconnexion dans 10s…")
+            await asyncio.sleep(10)
+
+
+async def _irc_session(
+    token: str,
+    nick: str,
+    channel: str,
+    queue: asyncio.Queue[ChatEvent],
+    known_emotes: set[str],
+) -> None:
+    reader, writer = await asyncio.open_connection(_IRC_HOST, _IRC_PORT)
     try:
-        await bot.start()
-    except Exception as e:
-        logger.error(f"[chat] erreur: {e!r}")
-        raise
+        bare = token.removeprefix("oauth:")
+        writer.write(f"PASS oauth:{bare}\r\nNICK {nick}\r\n".encode())
+        await writer.drain()
+
+        # Attente confirmation de connexion (001 = Welcome, 376 = End of MOTD)
+        async for line in _lines(reader):
+            if "001" in line or "376" in line:
+                break
+            if "NOTICE" in line and "Login authentication failed" in line:
+                raise ConnectionError(
+                    f"Authentification IRC échouée — vérifie TWITCH_IRC_TOKEN et TWITCH_IRC_NICK\n"
+                    f"  Réponse serveur: {line}"
+                )
+
+        writer.write(f"JOIN #{channel}\r\n".encode())
+        await writer.drain()
+        logger.info(f"[chat] connecté comme {nick!r} sur #{channel}")
+
+        async for line in _lines(reader):
+            # Keep-alive PING/PONG
+            if line.startswith("PING"):
+                writer.write(b"PONG :tmi.twitch.tv\r\n")
+                await writer.drain()
+                continue
+
+            m = _PRIVMSG_RE.match(line)
+            if not m:
+                continue
+
+            author, content = m.group(1), m.group(2)
+            event = ChatEvent(
+                timestamp=datetime.now(timezone.utc),
+                channel=channel,
+                author=author,
+                content=content,
+                emotes=extract_emote_tokens(content, known_emotes),
+            )
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                logger.warning("[chat] queue pleine, message ignoré")
+    finally:
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def _lines(reader: asyncio.StreamReader):
+    """Itérateur asynchrone sur les lignes IRC décodées."""
+    while True:
+        raw = await reader.readline()
+        if not raw:
+            raise ConnectionError("Connexion IRC fermée par le serveur")
+        yield raw.decode(errors="ignore").strip()

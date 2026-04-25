@@ -48,3 +48,18 @@ class Clip:
     candidate: ClipCandidate
     duration: float
     created_at: datetime = field(default_factory=utcnow)
+
+
+@dataclass
+class TwitchClip:
+    """Clip récupéré via l'API Helix Twitch."""
+    id: str                  # slug unique Twitch (ex: "FunnyPlayXYZ")
+    url: str                 # https://www.twitch.tv/clips/<id>
+    title: str
+    channel: str             # login du broadcaster
+    creator_name: str
+    view_count: int
+    duration: float          # secondes
+    created_at: datetime
+    thumbnail_url: str
+    local_path: str | None = None  # None à cette phase, rempli lors de l'export vidéo
