@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe -c \"import httpx, aiosqlite, pydantic_settings, typer, loguru; print\\('OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"from src.orchestrator.harvest import HarvestPipeline; from src.api.twitch import TwitchAPIClient; from src.core.errors import StreamerOfflineError; print\\('imports OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(.venv/Scripts/python.exe -c \"import inspect, twitchio.ext.commands; print\\(inspect.signature\\(twitchio.ext.commands.Bot.__init__\\)\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"from src.watcher.chat_capture import run_chat_capture; print\\('OK'\\)\")",
+      "Bash(.venv/Scripts/python.exe -c \"from src.main import app; from src.api.twitch import TwitchAPIClient; print\\('OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(.venv/Scripts/python -c ' *)",
+      "Bash(.venv/Scripts/python -c \"from src.core.events import ChatEvent; import inspect; print\\(inspect.signature\\(ChatEvent\\)\\)\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
+    ]
+  }
+}
