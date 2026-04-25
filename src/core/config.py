@@ -16,8 +16,9 @@ class Env(BaseSettings):
 
     twitch_client_id: str = ""
     twitch_client_secret: str = ""
-    twitch_irc_token: str = ""         # format "oauth:xxxx"
+    twitch_irc_token: str = ""         # format "oauth:xxxx" — pour IRC chat
     twitch_irc_nick: str = ""
+    twitch_user_token: str = ""        # token avec clips:edit (sans prefix oauth:)
 
     anthropic_api_key: str = ""
 
@@ -28,13 +29,18 @@ class Env(BaseSettings):
 
 class DetectorConfig(BaseModel):
     chat_window_seconds: int = 10
-    chat_velocity_threshold: float = 5.0
-    baseline_window_seconds: int = 60
-    velocity_multiplier: float = 3.0
+    baseline_window_seconds: int = 60       # utilisé par unique chatters tracker
     emote_density_threshold: float = 0.35
-    min_viral_score: int = 60
+    min_viral_score: float = 60.0
     cooldown_seconds: int = 60
     emotes: dict[str, list[str]] = Field(default_factory=dict)
+
+    # Velocity Z-score (remplace chat_velocity_threshold + velocity_multiplier)
+    stats_window_seconds: int = 300         # historique pour μ/σ (5 min)
+    z_score_threshold: float = 2.5          # σ au-dessus de μ pour déclencher
+    velocity_floor: float = 0.3             # msg/s minimum absolu (anti-bruit)
+    warmup_samples: int = 30               # ticks avant activation (~60 s)
+
 
 
 class ClipperConfig(BaseModel):

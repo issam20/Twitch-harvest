@@ -1,12 +1,13 @@
-"""Scorer: fusionne les 3 signaux (chat velocity, emote density, audio peak)
-et emet des ClipCandidate avec cooldown global pour eviter les doublons.
+"""Scorer: fusionne les 5 signaux chat et décide de clipper.
 
-Ponderation par defaut:
-- velocity  : 0.45 (signal le plus robuste)
-- emote     : 0.35 (confirme le type de moment)
-- audio     : 0.20 (precision temporelle)
+Règle de déclenchement :
+  - Signal 1 (velocity / Z-score) OBLIGATOIRE — doit être > 0
+  - Au moins 1 signal parmi {emote, unique chatters, caps, copypasta} doit être > 0
+  → 2 signaux minimum dont velocity
 
-Si audio non disponible (None), la ponderation est redistribuee sur velocity+emote.
+Score global = 50% velocity + 50% moyenne des autres signaux déclenchés.
+
+Cooldown de 120s entre deux clips pour éviter les doublons.
 """
 from __future__ import annotations
 
@@ -17,75 +18,89 @@ from ..core.logging import logger
 
 
 class ViralScorer:
-    def __init__(
-        self,
-        min_viral_score: int = 60,
-        cooldown_seconds: int = 60,
-        weights: dict[str, float] | None = None,
-    ):
-        self.min_viral_score = min_viral_score
+    def __init__(self, cooldown_seconds: int = 120, min_viral_score: float = 60.0) -> None:
         self.cooldown = timedelta(seconds=cooldown_seconds)
-        self.weights = weights or {"velocity": 0.45, "emote": 0.35, "audio": 0.20}
+        self.min_viral_score = min_viral_score
         self._last_trigger_at: datetime | None = None
 
     def evaluate(
         self,
         now: datetime,
         channel: str,
+        # Signal 1 — obligatoire
         velocity_score: float,
         velocity_debug: dict,
+        # Signal 2
         emote_score: float,
         emote_category: MomentCategory,
         emote_debug: dict,
-        audio_score: float | None,
-        audio_debug: dict | None,
+        # Signal 3
+        unique_score: float,
+        unique_debug: dict,
+        # Signal 4
+        caps_score: float,
+        caps_debug: dict,
+        # Signal 5
+        repetition_score: float,
+        repetition_debug: dict,
+        # Contexte
         sample_messages: list[str],
     ) -> ClipCandidate | None:
-        """Retourne un ClipCandidate si le score total >= seuil et cooldown ok, sinon None."""
 
-        # Fusion avec redistribution si audio manquant
-        if audio_score is None:
-            w_v = self.weights["velocity"] / (self.weights["velocity"] + self.weights["emote"])
-            w_e = self.weights["emote"] / (self.weights["velocity"] + self.weights["emote"])
-            total_score = w_v * velocity_score + w_e * emote_score
-            audio_score_for_log = None
-        else:
-            total_score = (
-                self.weights["velocity"] * velocity_score
-                + self.weights["emote"] * emote_score
-                + self.weights["audio"] * audio_score
-            )
-            audio_score_for_log = round(audio_score, 1)
-
-        # Log periodique (utile pour tuner les seuils)
-        if total_score >= self.min_viral_score * 0.7:
-            logger.debug(
-                f"[scorer] score={total_score:.1f} "
-                f"(v={velocity_score:.1f}, e={emote_score:.1f}, a={audio_score_for_log}) "
-                f"vdbg={velocity_debug} edbg={emote_debug}"
-            )
-
-        if total_score < self.min_viral_score:
+        # --- Gate 1 : velocity obligatoire ---
+        if velocity_score <= 0:
             return None
 
-        # Cooldown check
+        # --- Gate 2 : ≥1 autre signal déclenché ---
+        others = {
+            "emote": emote_score,
+            "chatters": unique_score,
+            "caps": caps_score,
+            "copypasta": repetition_score,
+        }
+        triggered_others = {name: s for name, s in others.items() if s > 0}
+        if not triggered_others:
+            return None
+
+        # --- Score global ---
+        avg_others = sum(triggered_others.values()) / len(triggered_others)
+        total_score = 0.50 * velocity_score + 0.50 * avg_others
+
+        triggered_names = ["velocity"] + list(triggered_others.keys())
+        logger.debug(
+            f"[scorer] score={total_score:.1f} signaux=[{', '.join(triggered_names)}] | "
+            f"v={velocity_score:.0f}(Z={velocity_debug.get('z', '?')}) "
+            f"e={emote_score:.0f} u={unique_score:.0f} c={caps_score:.0f} r={repetition_score:.0f}"
+        )
+
+        # --- Seuil minimum ---
+        if total_score < self.min_viral_score:
+            logger.debug(f"[scorer] score {total_score:.1f} < min {self.min_viral_score} — ignoré")
+            return None
+
+        # --- Cooldown ---
         if self._last_trigger_at is not None:
             elapsed = now - self._last_trigger_at
             if elapsed < self.cooldown:
-                logger.debug(f"[scorer] score {total_score:.1f} OK mais cooldown actif ({elapsed.total_seconds():.0f}s)")
+                remaining = (self.cooldown - elapsed).total_seconds()
+                logger.debug(f"[scorer] cooldown actif — {remaining:.0f}s restantes")
                 return None
 
-        # Declenchement
         self._last_trigger_at = now
 
         reason = (
-            f"score={total_score:.1f} | "
+            f"score={total_score:.1f} [{'+'.join(triggered_names)}] | "
             f"velocity {velocity_debug.get('velocity', '?')} msg/s "
-            f"(x{velocity_debug.get('ratio', '?')} baseline) | "
-            f"emotes {emote_debug.get('density', '?')*100:.0f}%"
+            f"(Z={velocity_debug.get('z', '?')}, μ={velocity_debug.get('mean', '?')})"
         )
-        if audio_score is not None:
-            reason += f" | audio_z={audio_debug.get('zscore', '?') if audio_debug else '?'}"
+        if "emote" in triggered_others:
+            reason += f" | emotes {emote_debug.get('density', 0)*100:.0f}%"
+        if "chatters" in triggered_others:
+            reason += f" | chatters ×{unique_debug.get('ratio', '?')}"
+        if "caps" in triggered_others:
+            reason += f" | caps {caps_debug.get('caps_ratio', 0)*100:.0f}%"
+        if "copypasta" in triggered_others:
+            reason += f" | copypasta {repetition_debug.get('top_ratio', 0)*100:.0f}%"
 
         return ClipCandidate(
             timestamp=now,

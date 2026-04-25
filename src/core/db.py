@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 import aiosqlite
+
+from .events import TwitchClip
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS clips (
@@ -20,6 +22,22 @@ CREATE TABLE IF NOT EXISTS clips (
 );
 
 CREATE INDEX IF NOT EXISTS idx_clips_channel_ts ON clips(channel, peak_ts);
+
+CREATE TABLE IF NOT EXISTS twitch_clips (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    twitch_id TEXT NOT NULL UNIQUE,
+    channel TEXT NOT NULL,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL,
+    creator_name TEXT NOT NULL,
+    view_count INTEGER NOT NULL,
+    duration REAL NOT NULL,
+    clip_created_at TEXT NOT NULL,
+    local_path TEXT,
+    harvested_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_twitch_clips_channel ON twitch_clips(channel);
 """
 
 
@@ -58,3 +76,34 @@ class Database:
             )
             await db.commit()
             return cursor.lastrowid or -1
+
+    async def record_twitch_clip(self, clip: TwitchClip) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                """INSERT OR IGNORE INTO twitch_clips
+                   (twitch_id, channel, title, url, creator_name, view_count,
+                    duration, clip_created_at, local_path, harvested_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    clip.id,
+                    clip.channel,
+                    clip.title,
+                    clip.url,
+                    clip.creator_name,
+                    clip.view_count,
+                    clip.duration,
+                    clip.created_at.isoformat(),
+                    clip.local_path,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            await db.commit()
+            return cursor.lastrowid or -1
+
+    async def count_twitch_clips(self, channel: str) -> int:
+        async with aiosqlite.connect(self.path) as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM twitch_clips WHERE channel = ?", (channel,)
+            )
+            row = await cursor.fetchone()
+            return row[0] if row else 0
