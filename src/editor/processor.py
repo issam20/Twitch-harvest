@@ -1,4 +1,4 @@
-"""Post-processing vidéo : smart cut → 9:16 → hook → sous-titres."""
+"""Post-processing vidéo : smart cut → 9:16 → sous-titres TikTok."""
 from __future__ import annotations
 
 import asyncio
@@ -9,19 +9,6 @@ from loguru import logger
 
 from ..core.config import EditorConfig, WebcamZone
 from ..core.events import MomentCategory
-
-
-def _ffmpeg_escape(text: str) -> str:
-    """Échappe les caractères spéciaux pour le filtre drawtext de ffmpeg."""
-    return (
-        text
-        .replace("\\", "\\\\")
-        .replace("'", "\\'")
-        .replace(":", "\\:")
-        .replace("%", "\\%")
-        .replace("[", "\\[")
-        .replace("]", "\\]")
-    )
 
 
 async def _run_ffmpeg(args: list[str]) -> tuple[int, str]:
@@ -48,10 +35,9 @@ class ClipProcessor:
         clip_duration_total: float = 60.0,
     ) -> Path | None:
         stem = clip_path.stem
-        tmp_cut  = self.output_dir / f"tmp_{stem}_cut.mp4"
-        tmp_916  = self.output_dir / f"tmp_{stem}_916.mp4"
-        tmp_hook = self.output_dir / f"tmp_{stem}_hook.mp4"
-        final    = self.output_dir / f"{stem}_processed.mp4"
+        tmp_cut = self.output_dir / f"tmp_{stem}_cut.mp4"
+        tmp_916 = self.output_dir / f"tmp_{stem}_916.mp4"
+        final   = self.output_dir / f"{stem}_processed.mp4"
 
         try:
             if not await self._smart_cut(clip_path, tmp_cut, clip_duration_total):
@@ -62,19 +48,14 @@ class ClipProcessor:
                 logger.error(f"[editor] conversion 9:16 échouée : {clip_path.name}")
                 return None
 
-            if not await self._add_hook(tmp_916, tmp_hook, category):
-                logger.warning("[editor] hook échoué — on continue sans")
-                shutil.copy2(tmp_916, tmp_hook)
-
-            if not await self._add_subtitles(tmp_hook, final):
-                logger.warning("[editor] sous-titres échoués — on continue sans")
-                shutil.move(str(tmp_hook), str(final))
-                tmp_hook = Path("/dev/null")  # ne pas essayer de supprimer à nouveau
+            if not await self._add_subtitles(tmp_916, final):
+                logger.warning("[editor] sous-titres échoués — copie brute")
+                shutil.copy2(tmp_916, final)
 
             return final
 
         finally:
-            for tmp in (tmp_cut, tmp_916, tmp_hook):
+            for tmp in (tmp_cut, tmp_916):
                 try:
                     if tmp.exists():
                         tmp.unlink()
@@ -132,61 +113,16 @@ class ClipProcessor:
             logger.error(f"[editor] ffmpeg build_916 rc={rc}: {stderr[:300]}")
         return rc == 0
 
-    async def _add_hook(
-        self, input: Path, output: Path, category: MomentCategory
-    ) -> bool:
-        cfg = self.settings
-        templates = cfg.hook_templates
-        text_map = {
-            MomentCategory.FUNNY: templates.funny,
-            MomentCategory.HYPE:  templates.hype,
-            MomentCategory.SHOCK: templates.shock,
-            MomentCategory.UNKNOWN: templates.unknown,
-        }
-        raw_text = text_map.get(category, templates.unknown)
-        hook_text = _ffmpeg_escape(raw_text)
-        hd = cfg.hook_duration
-
-        alpha = (
-            f"if(lt(t,{hd - 0.5}),1,"
-            f"if(lt(t,{hd}),({hd}-t)/0.5,0))"
-        )
-        drawtext = (
-            f"drawtext=text='{hook_text}'"
-            f":fontsize={cfg.hook_fontsize}"
-            f":fontcolor=yellow"
-            f":bordercolor=black"
-            f":borderw=4"
-            f":x=(w-text_w)/2"
-            f":y=h/3-text_h/2"
-            f":enable='between(t,0,{hd})'"
-            f":alpha='{alpha}'"
-        )
-
-        rc, stderr = await _run_ffmpeg([
-            "-i", str(input),
-            "-vf", drawtext,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-            "-c:a", "copy",
-            str(output),
-        ])
-        if rc != 0:
-            logger.warning(f"[editor] ffmpeg add_hook rc={rc}: {stderr[:300]}")
-        return rc == 0
-
     async def _add_subtitles(self, input: Path, output: Path) -> bool:
         try:
             from faster_whisper import WhisperModel
         except ImportError:
-            logger.warning(
-                "[editor] faster-whisper non installé — "
-                "pip install 'twitch-viral-clipper[editor]'"
-            )
+            logger.warning("[editor] faster-whisper non installé — pip install faster-whisper")
             return False
 
-        srt_path = input.with_suffix(".srt")
+        ass_path = input.with_suffix(".ass")
         try:
-            logger.info(f"[editor] transcription Whisper ({self.settings.whisper_model})…")
+            logger.info(f"[editor] transcription Whisper ({self.settings.whisper_model})...")
             model = WhisperModel(
                 self.settings.whisper_model, device="cpu", compute_type="int8"
             )
@@ -198,7 +134,7 @@ class ClipProcessor:
                 if not words:
                     continue
                 chunk_size = 3
-                n_chunks = max(1, -(-len(words) // chunk_size))  # ceil division
+                n_chunks = max(1, -(-len(words) // chunk_size))
                 seg_dur = seg.end - seg.start
                 chunk_dur = seg_dur / n_chunks
                 for i in range(n_chunks):
@@ -207,32 +143,39 @@ class ClipProcessor:
                     t_end = t_start + chunk_dur
                     entries.append((t_start, t_end, " ".join(chunk_words).upper()))
 
-            def _fmt(secs: float) -> str:
+            def _fmt_ass(secs: float) -> str:
                 h = int(secs // 3600)
                 m = int((secs % 3600) // 60)
                 s = int(secs % 60)
-                ms = int((secs % 1) * 1000)
-                return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-            srt_lines = []
-            for idx, (t0, t1, text) in enumerate(entries, 1):
-                srt_lines.append(f"{idx}\n{_fmt(t0)} --> {_fmt(t1)}\n{text}\n")
-            srt_path.write_text("\n".join(srt_lines), encoding="utf-8")
+                cs = int((secs % 1) * 100)
+                return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
             cfg = self.settings
-            force_style = (
-                f"FontName=Arial,"
-                f"FontSize={cfg.subtitle_fontsize},"
-                f"PrimaryColour={cfg.subtitle_color},"
-                f"OutlineColour=&H00000000,"
-                f"Outline={cfg.subtitle_outline},"
-                f"Bold=1,"
-                f"Alignment=2,"
-                f"MarginV=420"
+            ass_content = (
+                "[Script Info]\n"
+                "ScriptType: v4.00+\n"
+                "PlayResX: 1080\n"
+                "PlayResY: 1920\n\n"
+                "[V4+ Styles]\n"
+                "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+                "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+                "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+                "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+                f"Style: Default,Impact,{cfg.subtitle_fontsize},"
+                f"&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+                f"0,0,0,0,100,100,0,0,1,{cfg.subtitle_outline},1,2,10,10,120,1\n\n"
+                "[Events]\n"
+                "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
             )
-            # Sur Windows, le chemin SRT doit avoir les backslashes échappés
-            srt_str = str(srt_path).replace("\\", "/").replace(":", "\\:")
-            vf = f"subtitles={srt_str}:force_style='{force_style}'"
+            dialogues = [
+                f"Dialogue: 0,{_fmt_ass(t0)},{_fmt_ass(t1)},Default,,0,0,0,,{text}"
+                for t0, t1, text in entries
+            ]
+            ass_path.write_text(ass_content + "\n".join(dialogues), encoding="utf-8")
+
+            # Sur Windows, le chemin ASS doit avoir les backslashes échappés pour libass
+            ass_str = str(ass_path).replace("\\", "/").replace(":", "\\:")
+            vf = f"ass={ass_str}:fontsdir='C\\:/Windows/Fonts'"
 
             rc, stderr = await _run_ffmpeg([
                 "-i", str(input),
@@ -242,12 +185,12 @@ class ClipProcessor:
                 str(output),
             ])
             if rc != 0:
-                logger.warning(f"[editor] ffmpeg subtitles rc={rc}: {stderr[:300]}")
+                logger.error(f"[editor] ffmpeg subtitles rc={rc}: {stderr[:400]}")
             return rc == 0
 
         finally:
             try:
-                if srt_path.exists():
-                    srt_path.unlink()
+                if ass_path.exists():
+                    ass_path.unlink()
             except Exception:
                 pass
