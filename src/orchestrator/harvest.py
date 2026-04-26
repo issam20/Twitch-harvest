@@ -316,9 +316,11 @@ class HarvestPipeline:
         ts = clip.created_at.strftime("%Y%m%d_%H%M%S")
         filename = f"{clip.channel}_{ts}_{clip.id}.mp4"
         output_path = self._raw_dir / filename
+        # streamlink exige clips.twitch.tv/<id>, pas twitch.tv/clips/<id>
+        stream_url = f"https://clips.twitch.tv/{clip.id}"
         try:
             proc = await asyncio.create_subprocess_exec(
-                "streamlink", clip.url, "best", "-o", str(output_path),
+                "streamlink", stream_url, "best", "-o", str(output_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
