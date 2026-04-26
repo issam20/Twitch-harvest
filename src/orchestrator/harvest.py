@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 _PARIS = ZoneInfo("Europe/Paris")
@@ -93,6 +94,11 @@ class HarvestPipeline:
         self._collected: list[TwitchClip] = []
         self._msg_count: int = 0
         self._clip_in_progress: bool = False
+
+        self._raw_dir = env.data_dir / "clips" / "raw"
+        self._processed_dir = env.data_dir / "clips" / "processed"
+        self._raw_dir.mkdir(parents=True, exist_ok=True)
+        self._processed_dir.mkdir(parents=True, exist_ok=True)
 
     async def run(self) -> list[TwitchClip]:
         await self.db.init()
@@ -293,10 +299,48 @@ class HarvestPipeline:
                 f"[harvest] clip #{len(self._collected)} : "
                 f"{clip.title!r} ({clip.duration:.0f}s) → {clip.url}"
             )
+
+            local_path = await self._download_clip_mp4(clip)
+            if local_path is not None:
+                clip.local_path = str(local_path)
+                await self.db.update_clip_local_path(clip.id, clip.local_path)
+                logger.info(f"[download] sauvegardé → {clip.local_path}")
+
             if self.broadcaster:
                 await self.broadcaster.emit_clip(clip)
         finally:
             self._clip_in_progress = False
+
+    async def _download_clip_mp4(self, clip: TwitchClip) -> Path | None:
+        """Télécharge le MP4 du clip via streamlink. Retourne le Path ou None si échec."""
+        ts = clip.created_at.strftime("%Y%m%d_%H%M%S")
+        filename = f"{clip.channel}_{ts}_{clip.id}.mp4"
+        output_path = self._raw_dir / filename
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "streamlink", clip.url, "best", "-o", str(output_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                logger.warning(
+                    f"[download] streamlink rc={proc.returncode} : "
+                    f"{stderr.decode(errors='replace')[:300]}"
+                )
+                return None
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                logger.warning(f"[download] fichier vide ou absent : {output_path}")
+                return None
+            size_kb = output_path.stat().st_size // 1024
+            logger.info(f"[download] {filename} ({size_kb} Ko)")
+            return output_path
+        except FileNotFoundError:
+            logger.warning("[download] streamlink introuvable — vérifier l'installation système")
+            return None
+        except Exception as exc:
+            logger.warning(f"[download] erreur inattendue : {exc!r}")
+            return None
 
     async def _wait_for_clip(self, api: TwitchAPIClient, clip_id: str) -> dict | None:
         await asyncio.sleep(_CLIP_PROCESS_DELAY)

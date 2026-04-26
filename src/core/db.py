@@ -100,6 +100,14 @@ class Database:
             await db.commit()
             return cursor.lastrowid or -1
 
+    async def update_clip_local_path(self, twitch_id: str, local_path: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE twitch_clips SET local_path = ? WHERE twitch_id = ?",
+                (local_path, twitch_id),
+            )
+            await db.commit()
+
     async def count_twitch_clips(self, channel: str) -> int:
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(
