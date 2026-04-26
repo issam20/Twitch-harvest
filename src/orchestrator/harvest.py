@@ -18,6 +18,9 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+_PARIS = ZoneInfo("Europe/Paris")
 from typing import TYPE_CHECKING
 
 from ..api.twitch import TwitchAPIClient
@@ -103,7 +106,7 @@ class HarvestPipeline:
 
             logger.info(
                 f"[harvest] {self.streamer.login} est live depuis "
-                f"{started_at.strftime('%H:%M:%S')} UTC — écoute du chat démarrée"
+                f"{started_at.astimezone(_PARIS).strftime('%H:%M:%S')} (Paris) — écoute du chat démarrée"
             )
 
             chat_task = asyncio.create_task(self._run_chat(), name="chat")
@@ -174,7 +177,7 @@ class HarvestPipeline:
         while not self._stop.is_set():
             await asyncio.sleep(2.0)
             tick += 1
-            now = datetime.now(timezone.utc)
+            now = datetime.now(_PARIS)
 
             v_score, v_debug = self.velocity_tracker.score(now)
             e_score, e_cat, e_debug = self.emote_tracker.score(now)
