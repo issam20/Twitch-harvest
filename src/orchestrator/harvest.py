@@ -94,6 +94,7 @@ class HarvestPipeline:
         self._collected: list[TwitchClip] = []
         self._msg_count: int = 0
         self._clip_in_progress: bool = False
+        self._session_id: int | None = None
 
         self._raw_dir = env.data_dir / "clips" / "raw"
         self._processed_dir = env.data_dir / "clips" / "processed"
@@ -102,6 +103,10 @@ class HarvestPipeline:
 
     async def run(self) -> list[TwitchClip]:
         await self.db.init()
+        self._session_id = await self.db.create_session(
+            self.streamer.login, datetime.now(timezone.utc)
+        )
+        logger.info(f"[harvest] session #{self._session_id} ouverte pour {self.streamer.login}")
 
         async with TwitchAPIClient(
             self.env.twitch_client_id, self.env.twitch_client_secret
@@ -130,6 +135,13 @@ class HarvestPipeline:
             await asyncio.gather(*tasks, return_exceptions=True)
 
         logger.info(f"[harvest] terminé — {len(self._collected)} clip(s) créé(s)")
+        if self._session_id is not None:
+            await self.db.close_session(self._session_id, datetime.now(timezone.utc))
+            stats = await self.db.get_session_stats(self._session_id)
+            logger.info(
+                f"[harvest] session #{self._session_id} fermée — "
+                f"{stats['clip_count']} clips | top score {stats['top_score']:.1f}"
+            )
         return self._collected
 
     def stop(self) -> None:
@@ -265,9 +277,22 @@ class HarvestPipeline:
 
             if not self._clip_in_progress:
                 self._clip_in_progress = True
-                asyncio.create_task(self._clip_task(api, broadcaster_id))
+                asyncio.create_task(self._clip_task(
+                    api, broadcaster_id,
+                    v_score, e_score, u_score, c_score, r_score, composite,
+                ))
 
-    async def _clip_task(self, api: TwitchAPIClient, broadcaster_id: str) -> None:
+    async def _clip_task(
+        self,
+        api: TwitchAPIClient,
+        broadcaster_id: str,
+        v_score: float,
+        e_score: float,
+        u_score: float,
+        c_score: float,
+        r_score: float,
+        composite: float,
+    ) -> None:
         """Crée et récupère un clip en tâche de fond (non-bloquant pour le scorer)."""
         try:
             user_token = _bare_token(self.env.twitch_user_token or self.env.twitch_irc_token)
@@ -291,10 +316,28 @@ class HarvestPipeline:
                 duration=float(clip_data.get("duration", 0)),
                 created_at=datetime.fromisoformat(clip_data["created_at"].replace("Z", "+00:00")),
                 thumbnail_url=clip_data.get("thumbnail_url", ""),
-                local_path=None,
+                v_score=v_score,
+                e_score=e_score,
+                u_score=u_score,
+                c_score=c_score,
+                r_score=r_score,
+                composite_score=composite,
             )
             self._collected.append(clip)
-            await self.db.record_twitch_clip(clip)
+            await self.db.record_clip(
+                session_id=self._session_id,
+                twitch_id=clip.id,
+                url=clip.url,
+                title=clip.title,
+                duration=clip.duration,
+                created_at=clip.created_at,
+                v_score=clip.v_score,
+                e_score=clip.e_score,
+                u_score=clip.u_score,
+                c_score=clip.c_score,
+                r_score=clip.r_score,
+                composite_score=clip.composite_score,
+            )
             logger.info(
                 f"[harvest] clip #{len(self._collected)} : "
                 f"{clip.title!r} ({clip.duration:.0f}s) → {clip.url}"

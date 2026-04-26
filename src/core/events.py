@@ -62,4 +62,10 @@ class TwitchClip:
     duration: float          # secondes
     created_at: datetime
     thumbnail_url: str
-    local_path: str | None = None  # None à cette phase, rempli lors de l'export vidéo
+    local_path: str | None = None
+    v_score: float = 0.0
+    e_score: float = 0.0
+    u_score: float = 0.0
+    c_score: float = 0.0
+    r_score: float = 0.0
+    composite_score: float = 0.0

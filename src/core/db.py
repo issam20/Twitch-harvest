@@ -1,43 +1,39 @@
-"""SQLite async pour l'etat: clips produits, dernier pic par channel, etc."""
+"""SQLite async — sessions et clips avec scores de signaux."""
 from __future__ import annotations
 
-from pathlib import Path
 from datetime import datetime, timezone
+from pathlib import Path
 
 import aiosqlite
 
-from .events import TwitchClip
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    streamer TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS clips (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel TEXT NOT NULL,
-    path TEXT NOT NULL,
-    score REAL NOT NULL,
-    category TEXT NOT NULL,
-    reason TEXT,
-    peak_ts TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    published INTEGER DEFAULT 0
-);
-
-CREATE INDEX IF NOT EXISTS idx_clips_channel_ts ON clips(channel, peak_ts);
-
-CREATE TABLE IF NOT EXISTS twitch_clips (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER NOT NULL REFERENCES sessions(id),
     twitch_id TEXT NOT NULL UNIQUE,
-    channel TEXT NOT NULL,
-    title TEXT NOT NULL,
     url TEXT NOT NULL,
-    creator_name TEXT NOT NULL,
-    view_count INTEGER NOT NULL,
-    duration REAL NOT NULL,
-    clip_created_at TEXT NOT NULL,
-    local_path TEXT,
-    harvested_at TEXT NOT NULL
+    title TEXT NOT NULL,
+    duration REAL NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    v_score REAL NOT NULL DEFAULT 0,
+    e_score REAL NOT NULL DEFAULT 0,
+    u_score REAL NOT NULL DEFAULT 0,
+    c_score REAL NOT NULL DEFAULT 0,
+    r_score REAL NOT NULL DEFAULT 0,
+    composite_score REAL NOT NULL DEFAULT 0,
+    local_path TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_twitch_clips_channel ON twitch_clips(channel);
+CREATE INDEX IF NOT EXISTS idx_clips_session ON clips(session_id);
+CREATE INDEX IF NOT EXISTS idx_clips_composite ON clips(composite_score DESC);
 """
 
 
@@ -48,53 +44,59 @@ class Database:
 
     async def init(self) -> None:
         async with aiosqlite.connect(self.path) as db:
+            # Migration depuis l'ancien schéma (twitch_clips + clips sans sessions)
+            cur = await db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'"
+            )
+            if not await cur.fetchone():
+                await db.executescript(
+                    "DROP TABLE IF EXISTS twitch_clips; DROP TABLE IF EXISTS clips;"
+                )
             await db.executescript(SCHEMA)
             await db.commit()
 
-    async def record_clip(
-        self,
-        channel: str,
-        path: str,
-        score: float,
-        category: str,
-        reason: str,
-        peak_ts: datetime,
-    ) -> int:
+    async def create_session(self, streamer: str, started_at: datetime) -> int:
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(
-                """INSERT INTO clips (channel, path, score, category, reason, peak_ts, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    channel,
-                    path,
-                    score,
-                    category,
-                    reason,
-                    peak_ts.isoformat(),
-                    datetime.utcnow().isoformat(),
-                ),
+                "INSERT INTO sessions (streamer, started_at) VALUES (?, ?)",
+                (streamer, started_at.isoformat()),
             )
             await db.commit()
             return cursor.lastrowid or -1
 
-    async def record_twitch_clip(self, clip: TwitchClip) -> int:
+    async def close_session(self, session_id: int, ended_at: datetime) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE sessions SET ended_at = ? WHERE id = ?",
+                (ended_at.isoformat(), session_id),
+            )
+            await db.commit()
+
+    async def record_clip(
+        self,
+        session_id: int,
+        twitch_id: str,
+        url: str,
+        title: str,
+        duration: float,
+        created_at: datetime,
+        v_score: float,
+        e_score: float,
+        u_score: float,
+        c_score: float,
+        r_score: float,
+        composite_score: float,
+        local_path: str | None = None,
+    ) -> int:
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(
-                """INSERT OR IGNORE INTO twitch_clips
-                   (twitch_id, channel, title, url, creator_name, view_count,
-                    duration, clip_created_at, local_path, harvested_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                """INSERT OR IGNORE INTO clips
+                   (session_id, twitch_id, url, title, duration, created_at,
+                    v_score, e_score, u_score, c_score, r_score, composite_score, local_path)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    clip.id,
-                    clip.channel,
-                    clip.title,
-                    clip.url,
-                    clip.creator_name,
-                    clip.view_count,
-                    clip.duration,
-                    clip.created_at.isoformat(),
-                    clip.local_path,
-                    datetime.now(timezone.utc).isoformat(),
+                    session_id, twitch_id, url, title, duration, created_at.isoformat(),
+                    v_score, e_score, u_score, c_score, r_score, composite_score, local_path,
                 ),
             )
             await db.commit()
@@ -103,15 +105,30 @@ class Database:
     async def update_clip_local_path(self, twitch_id: str, local_path: str) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "UPDATE twitch_clips SET local_path = ? WHERE twitch_id = ?",
+                "UPDATE clips SET local_path = ? WHERE twitch_id = ?",
                 (local_path, twitch_id),
             )
             await db.commit()
 
-    async def count_twitch_clips(self, channel: str) -> int:
+    async def get_session_stats(self, session_id: int) -> dict:
         async with aiosqlite.connect(self.path) as db:
             cursor = await db.execute(
-                "SELECT COUNT(*) FROM twitch_clips WHERE channel = ?", (channel,)
+                """SELECT COUNT(*) as clip_count, MAX(composite_score) as top_score
+                   FROM clips WHERE session_id = ?""",
+                (session_id,),
             )
             row = await cursor.fetchone()
-            return row[0] if row else 0
+            return {
+                "clip_count": row[0] if row else 0,
+                "top_score": row[1] or 0.0 if row else 0.0,
+            }
+
+    async def get_clips_by_session(self, session_id: int) -> list[dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM clips WHERE session_id = ? ORDER BY composite_score DESC",
+                (session_id,),
+            )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
