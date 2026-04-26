@@ -18,6 +18,10 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+_PARIS = ZoneInfo("Europe/Paris")
 from typing import TYPE_CHECKING
 
 from ..api.twitch import TwitchAPIClient
@@ -90,9 +94,19 @@ class HarvestPipeline:
         self._collected: list[TwitchClip] = []
         self._msg_count: int = 0
         self._clip_in_progress: bool = False
+        self._session_id: int | None = None
+
+        self._raw_dir = env.data_dir / "clips" / "raw"
+        self._processed_dir = env.data_dir / "clips" / "processed"
+        self._raw_dir.mkdir(parents=True, exist_ok=True)
+        self._processed_dir.mkdir(parents=True, exist_ok=True)
 
     async def run(self) -> list[TwitchClip]:
         await self.db.init()
+        self._session_id = await self.db.create_session(
+            self.streamer.login, datetime.now(timezone.utc)
+        )
+        logger.info(f"[harvest] session #{self._session_id} ouverte pour {self.streamer.login}")
 
         async with TwitchAPIClient(
             self.env.twitch_client_id, self.env.twitch_client_secret
@@ -103,7 +117,7 @@ class HarvestPipeline:
 
             logger.info(
                 f"[harvest] {self.streamer.login} est live depuis "
-                f"{started_at.strftime('%H:%M:%S')} UTC — écoute du chat démarrée"
+                f"{started_at.astimezone(_PARIS).strftime('%H:%M:%S')} (Paris) — écoute du chat démarrée"
             )
 
             chat_task = asyncio.create_task(self._run_chat(), name="chat")
@@ -121,6 +135,13 @@ class HarvestPipeline:
             await asyncio.gather(*tasks, return_exceptions=True)
 
         logger.info(f"[harvest] terminé — {len(self._collected)} clip(s) créé(s)")
+        if self._session_id is not None:
+            await self.db.close_session(self._session_id, datetime.now(timezone.utc))
+            stats = await self.db.get_session_stats(self._session_id)
+            logger.info(
+                f"[harvest] session #{self._session_id} fermée — "
+                f"{stats['clip_count']} clips | top score {stats['top_score']:.1f}"
+            )
         return self._collected
 
     def stop(self) -> None:
@@ -174,7 +195,7 @@ class HarvestPipeline:
         while not self._stop.is_set():
             await asyncio.sleep(2.0)
             tick += 1
-            now = datetime.now(timezone.utc)
+            now = datetime.now(_PARIS)
 
             v_score, v_debug = self.velocity_tracker.score(now)
             e_score, e_cat, e_debug = self.emote_tracker.score(now)
@@ -196,8 +217,11 @@ class HarvestPipeline:
                 snap: dict = {
                     "t": now.strftime("%H:%M:%S"),
                     "msgs": self._msg_count,
-                    "v_val":   round(v_debug.get("velocity", 0.0), 2),
-                    "v_base":  round(v_debug.get("mean", 0.0), 2),
+                    "v_val":     round(v_debug.get("velocity", 0.0), 2),
+                    "v_base":    round(v_debug.get("mean", 0.0), 2),
+                    "v_z":       round(v_debug.get("z", 0.0), 2),
+                    "v_samples": v_debug.get("samples", 0),
+                    "warmup_max": self.velocity_tracker.warmup_samples,
                     "v_score": round(v_score, 1),
                     "e_score": round(e_score, 1),
                     "u_score": round(u_score, 1),
@@ -256,9 +280,22 @@ class HarvestPipeline:
 
             if not self._clip_in_progress:
                 self._clip_in_progress = True
-                asyncio.create_task(self._clip_task(api, broadcaster_id))
+                asyncio.create_task(self._clip_task(
+                    api, broadcaster_id,
+                    v_score, e_score, u_score, c_score, r_score, composite,
+                ))
 
-    async def _clip_task(self, api: TwitchAPIClient, broadcaster_id: str) -> None:
+    async def _clip_task(
+        self,
+        api: TwitchAPIClient,
+        broadcaster_id: str,
+        v_score: float,
+        e_score: float,
+        u_score: float,
+        c_score: float,
+        r_score: float,
+        composite: float,
+    ) -> None:
         """Crée et récupère un clip en tâche de fond (non-bloquant pour le scorer)."""
         try:
             user_token = _bare_token(self.env.twitch_user_token or self.env.twitch_irc_token)
@@ -282,18 +319,77 @@ class HarvestPipeline:
                 duration=float(clip_data.get("duration", 0)),
                 created_at=datetime.fromisoformat(clip_data["created_at"].replace("Z", "+00:00")),
                 thumbnail_url=clip_data.get("thumbnail_url", ""),
-                local_path=None,
+                v_score=v_score,
+                e_score=e_score,
+                u_score=u_score,
+                c_score=c_score,
+                r_score=r_score,
+                composite_score=composite,
             )
             self._collected.append(clip)
-            await self.db.record_twitch_clip(clip)
+            await self.db.record_clip(
+                session_id=self._session_id,
+                twitch_id=clip.id,
+                url=clip.url,
+                title=clip.title,
+                duration=clip.duration,
+                created_at=clip.created_at,
+                v_score=clip.v_score,
+                e_score=clip.e_score,
+                u_score=clip.u_score,
+                c_score=clip.c_score,
+                r_score=clip.r_score,
+                composite_score=clip.composite_score,
+                thumbnail_url=clip.thumbnail_url or None,
+            )
             logger.info(
                 f"[harvest] clip #{len(self._collected)} : "
                 f"{clip.title!r} ({clip.duration:.0f}s) → {clip.url}"
             )
+
+            local_path = await self._download_clip_mp4(clip)
+            if local_path is not None:
+                clip.local_path = str(local_path)
+                await self.db.update_clip_local_path(clip.id, clip.local_path)
+                logger.info(f"[download] sauvegardé → {clip.local_path}")
+
             if self.broadcaster:
                 await self.broadcaster.emit_clip(clip)
         finally:
             self._clip_in_progress = False
+
+    async def _download_clip_mp4(self, clip: TwitchClip) -> Path | None:
+        """Télécharge le MP4 du clip via streamlink. Retourne le Path ou None si échec."""
+        ts = clip.created_at.strftime("%Y%m%d_%H%M%S")
+        filename = f"{clip.channel}_{ts}_{clip.id}.mp4"
+        output_path = self._raw_dir / filename
+        # streamlink exige clips.twitch.tv/<id>, pas twitch.tv/clips/<id>
+        stream_url = f"https://clips.twitch.tv/{clip.id}"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "streamlink", stream_url, "best", "-o", str(output_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                logger.warning(
+                    f"[download] streamlink rc={proc.returncode} : "
+                    f"{stderr.decode(errors='replace')[:300]}"
+                )
+                return None
+            if not output_path.exists() or output_path.stat().st_size == 0:
+                logger.warning(f"[download] fichier vide ou absent : {output_path}")
+                return None
+            size_kb = output_path.stat().st_size // 1024
+            logger.info(f"[download] {filename} ({size_kb} Ko)")
+            return output_path
+        except FileNotFoundError:
+            logger.warning("[download] streamlink introuvable — vérifier l'installation système")
+            return None
+        except Exception as exc:
+            logger.warning(f"[download] erreur inattendue : {exc!r}")
+            return None
 
     async def _wait_for_clip(self, api: TwitchAPIClient, clip_id: str) -> dict | None:
         await asyncio.sleep(_CLIP_PROCESS_DELAY)

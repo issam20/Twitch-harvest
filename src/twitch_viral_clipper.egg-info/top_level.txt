@@ -1,0 +1,8 @@
+__init__
+api
+clipper
+core
+detector
+main
+orchestrator
+watcher
