@@ -14,8 +14,11 @@ import typer
 
 from .api.twitch import TwitchAPIClient
 from .core.config import Env, load_settings, load_streamer
+from .core.db import Database
 from .core.errors import StreamerOfflineError
+from .core.events import MomentCategory
 from .core.logging import logger, setup_logging
+from .editor.processor import ClipProcessor
 from .orchestrator.harvest import HarvestPipeline
 from .orchestrator.pipeline import Pipeline
 
@@ -205,6 +208,68 @@ def harvest(
     except KeyboardInterrupt:
         pipeline.stop()
         loop.run_until_complete(asyncio.sleep(0.3))
+    finally:
+        loop.close()
+
+
+@app.command()
+def process(
+    session: int = typer.Option(..., "--session", "-s", help="ID de la session à traiter"),
+    config_path: Path = typer.Option(Path("config/settings.yaml"), "--config"),
+    log_level: str = typer.Option("INFO", "--log-level", "-l"),
+):
+    """Post-traite les clips bruts d'une session : smart cut, 9:16, hook, sous-titres."""
+    setup_logging(level=log_level)
+    env = Env()
+    settings = load_settings(config_path)
+
+    async def _run() -> None:
+        db = Database(env.data_dir / "state.db")
+        await db.init()
+
+        session_data = await db.get_session(session)
+        if session_data is None:
+            logger.error(f"[process] session #{session} introuvable en base")
+            raise typer.Exit(1)
+
+        clips = await db.get_unprocessed_clips(session)
+        if not clips:
+            logger.info(f"[process] aucun clip à traiter pour la session #{session}")
+            return
+
+        streamer_login = session_data["streamer"]
+        streamer_cfg = load_streamer(streamer_login)
+        output_dir = env.data_dir / "clips" / "processed" / streamer_login
+        processor = ClipProcessor(output_dir=output_dir, settings=settings.editor)
+
+        success = 0
+        for i, clip in enumerate(clips, 1):
+            logger.info(f"[process] clip {i}/{len(clips)} : {clip['title']!r}")
+            try:
+                category = MomentCategory(clip.get("category", "unknown"))
+            except ValueError:
+                category = MomentCategory.UNKNOWN
+
+            result = await processor.process(
+                Path(clip["local_path"]),
+                streamer_cfg.webcam_zone,
+                category=category,
+                clip_duration_total=float(clip["duration"]),
+            )
+            if result is not None:
+                await db.update_clip_processed_path(clip["twitch_id"], str(result))
+                success += 1
+                logger.info(f"[process] → {result.name}")
+
+        logger.info(f"[process] terminé — {success}/{len(clips)} clips traités")
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_run())
+    except (SystemExit, typer.Exit):
+        raise
+    except KeyboardInterrupt:
+        logger.info("[process] interrompu")
     finally:
         loop.close()
 

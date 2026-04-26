@@ -54,11 +54,15 @@ class Database:
                     "DROP TABLE IF EXISTS twitch_clips; DROP TABLE IF EXISTS clips;"
                 )
             await db.executescript(SCHEMA)
-            # Ajout colonne thumbnail_url si absente (migration idempotente)
-            try:
-                await db.execute("ALTER TABLE clips ADD COLUMN thumbnail_url TEXT")
-            except Exception:
-                pass
+            # Migrations idempotentes
+            for col_sql in (
+                "ALTER TABLE clips ADD COLUMN thumbnail_url TEXT",
+                "ALTER TABLE clips ADD COLUMN processed_path TEXT",
+            ):
+                try:
+                    await db.execute(col_sql)
+                except Exception:
+                    pass
             await db.commit()
 
     async def create_session(self, streamer: str, started_at: datetime) -> int:
@@ -141,6 +145,37 @@ class Database:
             )
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
+
+    async def get_session(self, session_id: int) -> dict | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM sessions WHERE id = ?", (session_id,)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def get_unprocessed_clips(self, session_id: int) -> list[dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """SELECT * FROM clips
+                   WHERE session_id = ?
+                     AND local_path IS NOT NULL
+                     AND processed_path IS NULL
+                   ORDER BY composite_score DESC""",
+                (session_id,),
+            )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    async def update_clip_processed_path(self, twitch_id: str, processed_path: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE clips SET processed_path = ? WHERE twitch_id = ?",
+                (processed_path, twitch_id),
+            )
+            await db.commit()
 
     async def get_all_sessions(self) -> list[dict]:
         async with aiosqlite.connect(self.path) as db:

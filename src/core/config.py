@@ -55,10 +55,32 @@ class OrchestratorConfig(BaseModel):
     log_level: str = "INFO"
 
 
+class HookTemplates(BaseModel):
+    funny: str = "WAIT FOR IT 😭"
+    hype: str = "WATCH THIS 🔥"
+    shock: str = "NO WAY 💀"
+    unknown: str = "CHAT WENT CRAZY"
+
+
+class EditorConfig(BaseModel):
+    whisper_model: str = "medium"
+    subtitle_fontsize: int = 75
+    subtitle_color: str = "&H00FFFF"
+    subtitle_outline: int = 3
+    gameplay_ratio: float = 0.55
+    clip_duration: int = 15
+    pre_peak_seconds: int = 3
+    peak_offset_seconds: int = -3
+    hook_duration: float = 2.0
+    hook_fontsize: int = 90
+    hook_templates: HookTemplates = HookTemplates()
+
+
 class Settings(BaseModel):
     detector: DetectorConfig = DetectorConfig()
     clipper: ClipperConfig = ClipperConfig()
     orchestrator: OrchestratorConfig = OrchestratorConfig()
+    editor: EditorConfig = EditorConfig()
 
 
 # ---------- YAML par streamer ----------

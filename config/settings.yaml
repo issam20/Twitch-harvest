@@ -50,3 +50,20 @@ clipper:
 
 orchestrator:
   log_level: INFO
+
+editor:
+  whisper_model: medium
+  subtitle_fontsize: 75
+  subtitle_color: "&H00FFFF"
+  subtitle_outline: 3
+  gameplay_ratio: 0.55
+  clip_duration: 15
+  pre_peak_seconds: 3
+  peak_offset_seconds: -3
+  hook_duration: 2.0
+  hook_fontsize: 90
+  hook_templates:
+    funny: "WAIT FOR IT 😭"
+    hype: "WATCH THIS 🔥"
+    shock: "NO WAY 💀"
+    unknown: "CHAT WENT CRAZY"
