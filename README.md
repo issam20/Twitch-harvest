@@ -1,134 +1,159 @@
-# Twitch Viral Clipper — MVP Étage 1
+# Twitch Harvest
 
-Pipeline de détection temps réel de moments viraux sur un stream Twitch.
-Version MVP : **Watcher + Detector (3 signaux) + Clipper**. Pas encore d'édition ni d'upload.
+Pipeline de détection temps réel de moments viraux sur un live Twitch.
+Surveille le chat en continu, détecte les pics d'activité via 5 signaux indépendants, crée automatiquement des clips via l'API Helix et les télécharge en MP4.
 
-## Architecture (Étage 1 seul)
+## Architecture
 
 ```
-        ┌─────────────┐
-Twitch ─┤ VideoCapture │──► buffer/<channel>/seg_*.ts  (chunks 10s, fenêtre 2min)
-        │ (streamlink  │
-        │  + ffmpeg)   │
-        └─────────────┘
-        ┌─────────────┐
-Twitch ─┤ AudioMonitor │──► loudness en RAM (ebur128)
-        │ (streamlink  │
-        │  + ebur128)  │
-        └─────────────┘
-        ┌─────────────┐     ┌──────────────────────┐
-Chat  ──┤   ChatBot   ├────►│ 3 Trackers           │
-        │ (twitchio)  │     │  - velocity          │     ┌─────────┐
-        └─────────────┘     │  - emote density     ├────►│ Scorer  │──► Candidate
-                            │  - audio snapshot    │     │ + cool- │
-                            └──────────────────────┘     │  down   │       │
-                                                         └─────────┘       ▼
-                                                                   ┌──────────────┐
-                                                                   │   Clipper    │
-                                                                   │  (ffmpeg     │
-                                                                   │   concat)    │
-                                                                   └──────────────┘
-                                                                          │
-                                                                          ▼
-                                                              data/clips/*.mp4 + SQLite
+Chat IRC (twitchio)
+        |
+        v
++-------------------------------+
+|         5 Détecteurs          |
+|  1. Velocity  (Z-score adapt) |
+|  2. Emote density             |
+|  3. Unique chatters           |
+|  4. Caps ratio                |
+|  5. Repetition / copypasta    |
++---------------+---------------+
+                |  score 0-100 par signal
+                v
+        +-------------+
+        | ViralScorer |  gate 1 : velocity > 0
+        |             |  gate 2 : >= 1 autre signal
+        |             |  gate 3 : score composite >= min_viral_score
+        |             |  cooldown 120s
+        +------+------+
+               |
+               v
+    POST /helix/clips  (Twitch API)
+               |
+               v
+    streamlink -> data/clips/raw/*.mp4
+               |
+               v
+    SQLite  (sessions + clips + scores)
+               |
+               v
+    Dashboard FastAPI (SSE live + historique)
 ```
+
+## Signaux
+
+| Signal | Déclenchement | Algorithme |
+|--------|--------------|-----------|
+| **Velocity** | Obligatoire | Z-score sur fenêtre glissante 5min — auto-calibré à la taille du chat |
+| **Emote** | >= 1 requis | Ratio emotes/messages sur fenêtre 10s |
+| **Unique chatters** | >= 1 requis | Ratio nouveaux chatters vs baseline 60s |
+| **Caps** | >= 1 requis | Ratio messages en majuscules |
+| **Répétition** | >= 1 requis | Ratio copypasta (messages quasi-identiques) |
+
+Score composite = 50% velocity + 50% moyenne des signaux déclenchés.
 
 ## Prérequis
 
-### Outils système
+**Python 3.12+** et **streamlink** :
 
-**Linux / macOS**
 ```bash
-sudo apt install ffmpeg      # ou brew install ffmpeg
+# Windows
+winget install streamlink.streamlink
+
+# Linux / macOS
 pip install streamlink
 ```
 
-**Windows** (applicable à ton poste PwC)
-```powershell
-winget install Gyan.FFmpeg
-winget install streamlink.streamlink
-# verifier que les 2 sont dans le PATH (redemarrer le terminal si besoin)
-ffmpeg -version
-streamlink --version
-```
-
-### Python et dépendances
-
-Python 3.12+ requis.
-
 ```bash
 python -m venv .venv
-# Linux/macOS
-source .venv/bin/activate
-# Windows PowerShell
-.venv\Scripts\Activate.ps1
+source .venv/bin/activate      # Linux/macOS
+.venv\Scripts\Activate.ps1     # Windows
 
 pip install -e .
-# pour les tests
-pip install -e ".[dev]"
 ```
 
-### Tokens Twitch
+## Configuration
 
-1. Créer une app sur https://dev.twitch.tv/console/apps
-   - Redirect URL : `http://localhost` (non utilisé pour le MVP mais requis)
-   - Récupérer `CLIENT_ID` et `CLIENT_SECRET` → dans `.env`
+Copier `.env.example` -> `.env` et renseigner :
 
-2. Token OAuth chat (IRC)
-   - Générer sur https://twitchtokengenerator.com/ avec scope `chat:read`
-   - Format attendu : `oauth:xxxxxxxxxxxxx`
-   - **Recommandé** : créer un compte Twitch dédié au bot (pas ton compte perso)
+```env
+TWITCH_CLIENT_ID=...
+TWITCH_CLIENT_SECRET=...
+TWITCH_IRC_TOKEN=oauth:...    # token chat:read
+TWITCH_IRC_NICK=...           # login du compte bot
+TWITCH_USER_TOKEN=...         # token clips:edit (sans oauth:)
+```
 
-Copier `.env.example` vers `.env` et remplir.
+Générer `TWITCH_USER_TOKEN` via Device Flow intégré :
+
+```bash
+python -m src.main auth
+```
+
+### Tuning (`config/settings.yaml`)
+
+```yaml
+detector:
+  z_score_threshold: 2.5    # sigmas au-dessus de la moyenne pour déclencher
+  min_viral_score: 60.0     # score composite minimum pour créer un clip
+  cooldown_seconds: 120     # pause entre deux clips
+  warmup_samples: 30        # ticks avant activation (~60s)
+```
+
+Surcharges par streamer dans `config/streamers/<login>.yaml`.
 
 ## Lancement
 
 ```bash
-python -m src.main watch --streamer <login_twitch>
-# ex:
-python -m src.main watch --streamer zerator --log-level DEBUG
+# Harvest seul
+python -m src.main harvest --streamer <login>
+
+# Avec dashboard web
+python -m src.main harvest --streamer <login> --dashboard
+
+# Options
+--cooldown 90       # cooldown personnalisé
+--port 8080         # port dashboard (défaut 8000)
+--log-level DEBUG
 ```
 
-Le pipeline :
-1. Se connecte au chat IRC
-2. Lance deux streamlinks (video pour le buffer, audio pour l'ebur128)
-3. Attend 20-30s que la baseline chat + audio se stabilise
-4. À chaque candidat détecté, écrit un `.mp4` dans `data/clips/` et l'enregistre en SQLite
+## Dashboard
 
-**Arrêt** : `Ctrl+C`.
+| Page | URL | Contenu |
+|------|-----|---------|
+| Live | `http://localhost:8000/` | Graphiques velocity + signaux, stats session, tableau clips |
+| Historique | `http://localhost:8000/sessions` | Tableau numérique triable par signal, toutes sessions |
 
-## Tuning des seuils
+Fonctionnalités live :
+- Velocity msg/s vs baseline (moyenne mobile 5min)
+- Scores des 5 signaux + composite (0-100)
+- Z-score coloré dans le header (neutre → orange → rouge)
+- Tableau des clips triable par colonne (Score/V/E/U/C/R)
+- Lignes verticales sur les graphiques à chaque clip créé
+- Barre de warmup et cooldown en temps réel
+- Flash rouge sur le body à chaque nouveau clip
 
-Tout est dans `config/settings.yaml`. Les valeurs par défaut sont conservatrices.
-
-Pour un **gros streamer** (xQc, Kai Cenat) : monter `chat_velocity_threshold` à 20-40 et `velocity_multiplier` à 2.5. Sinon tu vas clipper en continu.
-
-Pour un **petit streamer** (< 500 viewers) : baisser `chat_velocity_threshold` à 2.0. La baseline plancher (0.2 msg/s dans le code) évite les divisions par zéro.
-
-Overrides par streamer possibles dans `config/streamers/<login>.yaml`.
-
-## Structure du projet
+## Structure
 
 ```
 src/
-├── main.py                    # CLI
+├── main.py                    # CLI (typer)
 ├── core/
-│   ├── config.py              # env + YAML
-│   ├── db.py                  # SQLite async
-│   ├── events.py              # dataclasses
+│   ├── config.py              # env + YAML (pydantic-settings)
+│   ├── db.py                  # SQLite async (aiosqlite) — sessions/clips
+│   ├── events.py              # dataclasses (ChatEvent, TwitchClip...)
 │   └── logging.py
+├── api/
+│   ├── twitch.py              # client Helix (httpx async)
+│   └── dashboard.py           # FastAPI + SSE + HTML embarqué
 ├── watcher/
-│   ├── chat_capture.py        # IRC via twitchio
-│   ├── video_capture.py       # streamlink -> ffmpeg segment
-│   └── audio_capture.py       # streamlink -> ffmpeg ebur128
+│   └── chat_capture.py        # IRC twitchio
 ├── detector/
-│   ├── chat_velocity.py       # signal 1
-│   ├── emote_spam.py          # signal 2
-│   └── scorer.py              # fusion + cooldown
-├── clipper/
-│   └── extractor.py           # ffmpeg concat + cut
+│   ├── chat_velocity.py       # Z-score adaptatif
+│   ├── emote_spam.py          # densité d'emotes
+│   ├── chat_signals.py        # caps, unique chatters, répétition
+│   └── scorer.py              # fusion + gates + cooldown
 └── orchestrator/
-    └── pipeline.py            # colle tout
+    └── harvest.py             # pipeline principal
 ```
 
 ## Tests
@@ -137,19 +162,14 @@ src/
 pytest tests/ -v
 ```
 
-12 tests unitaires, pas de réseau requis. Couvre les 3 signaux et la logique de fusion/cooldown.
+## Limitations connues
 
-## Limitations connues (phase 2 à venir)
+- Emotes FFZ/BTTV non détectées — seules les emotes listées dans `config/settings.yaml` sont reconnues
+- Windows : `add_signal_handler` non supporté sur ProactorEventLoop — Ctrl+C fonctionne via KeyboardInterrupt
+- streamlink doit être installé séparément (non inclus dans `pyproject.toml`)
 
-- Pas d'édition vidéo (9:16, sous-titres, recadrage webcam)
-- Pas d'appel Claude pour classification post-clip
-- Pas d'upload TikTok
-- Détection d'emotes par regex textuelle (ne capte pas les emotes natives Twitch transmises comme bitmaps IRC — suffit pour KEKW/OMEGALUL/etc qui arrivent comme du texte)
-- Windows : `add_signal_handler` non supporté sur ProactorEventLoop → Ctrl+C fonctionne mais via KeyboardInterrupt
+## Roadmap
 
-## Prochaines étapes
-
-1. Lancer sur un streamer connu pendant 1h, observer les logs DEBUG
-2. Tuner `chat_velocity_threshold` et `min_viral_score` selon le streamer
-3. Phase 2 : Editor (Whisper + ffmpeg 9:16 + sous-titres) + Claude classifier
-4. Phase 3 : Publisher TikTok (ou notification Telegram en fallback)
+- **Phase 2B** : recadrage 9:16 (ffmpeg), sous-titres (Whisper)
+- **Phase 3** : classification Claude (catégorie, viralité prédite)
+- **Phase 4** : upload TikTok / notification Telegram
