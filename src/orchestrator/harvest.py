@@ -217,8 +217,11 @@ class HarvestPipeline:
                 snap: dict = {
                     "t": now.strftime("%H:%M:%S"),
                     "msgs": self._msg_count,
-                    "v_val":   round(v_debug.get("velocity", 0.0), 2),
-                    "v_base":  round(v_debug.get("mean", 0.0), 2),
+                    "v_val":     round(v_debug.get("velocity", 0.0), 2),
+                    "v_base":    round(v_debug.get("mean", 0.0), 2),
+                    "v_z":       round(v_debug.get("z", 0.0), 2),
+                    "v_samples": v_debug.get("samples", 0),
+                    "warmup_max": self.velocity_tracker.warmup_samples,
                     "v_score": round(v_score, 1),
                     "e_score": round(e_score, 1),
                     "u_score": round(u_score, 1),
@@ -337,6 +340,7 @@ class HarvestPipeline:
                 c_score=clip.c_score,
                 r_score=clip.r_score,
                 composite_score=clip.composite_score,
+                thumbnail_url=clip.thumbnail_url or None,
             )
             logger.info(
                 f"[harvest] clip #{len(self._collected)} : "
