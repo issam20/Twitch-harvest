@@ -183,6 +183,17 @@ class DeepSeekAnalyzer:
                 choice = response.choices[0]
                 raw = choice.message.content or ""
                 finish = choice.finish_reason
+                # Les modèles reasoning mettent parfois le JSON dans reasoning_content
+                if not raw:
+                    raw = getattr(choice.message, "reasoning_content", None) or ""
+                    if raw:
+                        logger.debug("[analyzer] content vide → fallback reasoning_content")
+                if not raw:
+                    logger.warning(
+                        f"[analyzer] tentative {attempt + 1}/3 : réponse vide "
+                        f"(finish={finish!r}, model={self._model!r})"
+                    )
+                    continue
                 logger.debug(f"[analyzer] finish_reason={finish!r} raw={raw[:200]!r}")
                 # Extrait le premier bloc JSON valide meme si le modele ajoute du texte
                 start = raw.find("{")
