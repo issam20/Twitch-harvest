@@ -1,7 +1,6 @@
 """Tests unitaires pour DeepSeekAnalyzer (sans appel réseau)."""
 from __future__ import annotations
 
-import asyncio
 import json
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -10,7 +9,6 @@ import pytest
 
 from src.core.events import ClipCandidate, MomentCategory, TwitchClip
 from src.editor.ai_analyzer import DeepSeekAnalyzer, EditPlan
-from src.editor.clip_edit_queue import ClipEditQueue
 
 
 def _valid_plan(**overrides) -> dict:
@@ -95,22 +93,3 @@ async def test_invalid_json_retries_and_fallback(mock_openai):
     assert plan.worth_editing is False
     assert plan.confidence == 0.0
     assert mock_openai.chat.completions.create.call_count == 3
-
-
-async def test_worth_editing_false_on_low_score(mock_openai):
-    mock_openai.chat.completions.create.return_value = MagicMock(
-        choices=[MagicMock(message=MagicMock(
-            content=json.dumps(_valid_plan(worth_editing=False, confidence=0.1))
-        ))]
-    )
-
-    editor = AsyncMock()
-    analyzer = DeepSeekAnalyzer(api_key="test_key")
-    queue = ClipEditQueue(analyzer=analyzer, editor=editor)
-    await queue.start()
-
-    queue.push(_make_clip(), _make_candidate())
-    await asyncio.sleep(0.1)
-    await queue.stop()
-
-    editor.render.assert_not_called()

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+from datetime import datetime
 from pathlib import Path
 
 import typer
@@ -16,7 +17,7 @@ from .api.twitch import TwitchAPIClient
 from .core.config import Env, load_settings, load_streamer
 from .core.db import Database
 from .core.errors import StreamerOfflineError
-from .core.events import MomentCategory
+from .core.events import ClipCandidate, MomentCategory, TwitchClip
 from .core.logging import logger, setup_logging
 from .editor.processor import ClipProcessor
 from .orchestrator.harvest import HarvestPipeline
@@ -270,6 +271,107 @@ def process(
         raise
     except KeyboardInterrupt:
         logger.info("[process] interrompu")
+    finally:
+        loop.close()
+
+
+@app.command()
+def edit(
+    session: int | None = typer.Option(None, "--session", "-s", help="ID de la session à éditer"),
+    clip: str | None = typer.Option(None, "--clip", "-c", help="Twitch clip ID à éditer"),
+    last: bool = typer.Option(False, "--last", help="Utiliser la dernière session"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Liste les clips sans appeler l'API"),
+    config_path: Path = typer.Option(Path("config/settings.yaml"), "--config"),
+    log_level: str = typer.Option("INFO", "--log-level", "-l"),
+):
+    """Analyse les clips d'une session avec DeepSeek et génère les Edit Plans."""
+    setup_logging(level=log_level)
+    env = Env()
+
+    async def _run() -> None:
+        db = Database(env.data_dir / "state.db")
+        await db.init()
+
+        if last:
+            sess = await db.get_last_session()
+            if sess is None:
+                logger.error("[edit] aucune session en base")
+                raise typer.Exit(1)
+            clips = await db.get_clips_by_session(sess["id"])
+        elif session is not None:
+            sess = await db.get_session(session)
+            if sess is None:
+                logger.error(f"[edit] session #{session} introuvable")
+                raise typer.Exit(1)
+            clips = await db.get_clips_by_session(session)
+        elif clip is not None:
+            row = await db.get_clip_by_twitch_id(clip)
+            if row is None:
+                logger.error(f"[edit] clip {clip!r} introuvable")
+                raise typer.Exit(1)
+            clips = [row]
+        else:
+            logger.error("[edit] précise --session, --clip ou --last")
+            raise typer.Exit(1)
+
+        if not clips:
+            logger.info("[edit] aucun clip à traiter")
+            return
+
+        if dry_run:
+            logger.info(f"[edit] dry-run — {len(clips)} clip(s) trouvé(s), aucune analyse lancée")
+            for c in clips:
+                logger.info(f"  - {c['twitch_id']} | score={c['composite_score']:.1f}")
+            return
+
+        if not env.deepseek_api_key:
+            logger.error("[edit] DEEPSEEK_API_KEY manquant dans .env")
+            raise typer.Exit(1)
+
+        from .editor.ai_analyzer import DeepSeekAnalyzer
+        from .editor.video_editor import VideoEditor
+
+        analyzer = DeepSeekAnalyzer(env.deepseek_api_key)
+        editor = VideoEditor()
+
+        for i, row in enumerate(clips, 1):
+            logger.info(f"[edit] {i}/{len(clips)} — {row['twitch_id']}")
+            twitch_clip = TwitchClip(
+                id=row["twitch_id"],
+                url=row["url"],
+                title=row["title"],
+                channel=row.get("channel", ""),
+                creator_name="auto",
+                view_count=0,
+                duration=float(row["duration"]),
+                created_at=datetime.fromisoformat(row["created_at"]),
+                thumbnail_url=row.get("thumbnail_url") or "",
+            )
+            candidate = ClipCandidate(
+                timestamp=datetime.fromisoformat(row["created_at"]),
+                channel=row.get("channel", ""),
+                score=float(row["composite_score"]),
+                category=MomentCategory(row.get("category") or "unknown"),
+                reason="from DB",
+                chat_velocity=float(row.get("v_score") or 0),
+                emote_density=float(row.get("e_score") or 0) / 100.0,
+                sample_messages=[],
+            )
+
+            plan = await analyzer.analyze(twitch_clip, candidate)
+            await db.update_clip_edit_result(row["id"], plan.model_dump_json())
+
+            if plan.worth_editing and row.get("local_path"):
+                twitch_clip.local_path = row["local_path"]
+                await editor.render(twitch_clip, plan)
+
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(_run())
+    except (SystemExit, typer.Exit):
+        raise
+    except KeyboardInterrupt:
+        logger.info("[edit] interrompu")
     finally:
         loop.close()
 

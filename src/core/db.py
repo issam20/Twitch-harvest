@@ -54,15 +54,16 @@ class Database:
                     "DROP TABLE IF EXISTS twitch_clips; DROP TABLE IF EXISTS clips;"
                 )
             await db.executescript(SCHEMA)
-            # Migrations idempotentes
-            for col_sql in (
-                "ALTER TABLE clips ADD COLUMN thumbnail_url TEXT",
-                "ALTER TABLE clips ADD COLUMN processed_path TEXT",
+            # Migrations idempotentes via PRAGMA table_info (robuste)
+            existing_cols = await self._table_columns(db, "clips")
+            for col_name, col_sql in (
+                ("thumbnail_url", "ALTER TABLE clips ADD COLUMN thumbnail_url TEXT"),
+                ("processed_path", "ALTER TABLE clips ADD COLUMN processed_path TEXT"),
+                ("category", "ALTER TABLE clips ADD COLUMN category TEXT"),
+                ("edit_plan_json", "ALTER TABLE clips ADD COLUMN edit_plan_json TEXT"),
             ):
-                try:
+                if col_name not in existing_cols:
                     await db.execute(col_sql)
-                except Exception:
-                    pass
             await db.commit()
 
     async def create_session(self, streamer: str, started_at: datetime) -> int:
@@ -97,6 +98,7 @@ class Database:
         r_score: float,
         composite_score: float,
         thumbnail_url: str | None = None,
+        category: str = "unknown",
         local_path: str | None = None,
     ) -> int:
         async with aiosqlite.connect(self.path) as db:
@@ -104,12 +106,12 @@ class Database:
                 """INSERT OR IGNORE INTO clips
                    (session_id, twitch_id, url, title, duration, created_at,
                     v_score, e_score, u_score, c_score, r_score, composite_score,
-                    thumbnail_url, local_path)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    thumbnail_url, category, local_path)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id, twitch_id, url, title, duration, created_at.isoformat(),
                     v_score, e_score, u_score, c_score, r_score, composite_score,
-                    thumbnail_url, local_path,
+                    thumbnail_url, category, local_path,
                 ),
             )
             await db.commit()
@@ -120,6 +122,14 @@ class Database:
             await db.execute(
                 "UPDATE clips SET local_path = ? WHERE twitch_id = ?",
                 (local_path, twitch_id),
+            )
+            await db.commit()
+
+    async def update_clip_edit_result(self, clip_id: int, edit_plan_json: str) -> None:
+        async with aiosqlite.connect(self.path) as db:
+            await db.execute(
+                "UPDATE clips SET edit_plan_json = ? WHERE id = ?",
+                (edit_plan_json, clip_id),
             )
             await db.commit()
 
@@ -136,21 +146,48 @@ class Database:
                 "top_score": row[1] or 0.0 if row else 0.0,
             }
 
-    async def get_clips_by_session(self, session_id: int) -> list[dict]:
+    async def get_last_session(self) -> dict | None:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT * FROM clips WHERE session_id = ? ORDER BY composite_score DESC",
-                (session_id,),
+                "SELECT * FROM sessions ORDER BY started_at DESC LIMIT 1"
             )
-            rows = await cursor.fetchall()
-            return [dict(r) for r in rows]
+            row = await cursor.fetchone()
+            return dict(row) if row else None
 
     async def get_session(self, session_id: int) -> dict | None:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
                 "SELECT * FROM sessions WHERE id = ?", (session_id,)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def get_clips_by_session(self, session_id: int) -> list[dict]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM clips WHERE session_id = ? ORDER BY created_at ASC",
+                (session_id,),
+            )
+            rows = await cursor.fetchall()
+            return [dict(r) for r in rows]
+
+    async def get_clip_by_twitch_id(self, twitch_id: str) -> dict | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM clips WHERE twitch_id = ?", (twitch_id,)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def get_clip_by_id(self, clip_id: int) -> dict | None:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM clips WHERE id = ?", (clip_id,)
             )
             row = await cursor.fetchone()
             return dict(row) if row else None
@@ -191,3 +228,10 @@ class Database:
             )
             rows = await cursor.fetchall()
             return [dict(r) for r in rows]
+
+    @staticmethod
+    async def _table_columns(db, table: str) -> set[str]:
+        """Retourne l'ensemble des noms de colonnes d'une table via PRAGMA."""
+        cursor = await db.execute(f"PRAGMA table_info({table})")
+        rows = await cursor.fetchall()
+        return {row[1] for row in rows}

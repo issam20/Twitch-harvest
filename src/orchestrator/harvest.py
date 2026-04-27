@@ -15,6 +15,8 @@ Flow :
 """
 from __future__ import annotations
 
+import shutil
+
 import asyncio
 from collections import deque
 from datetime import datetime, timezone
@@ -29,8 +31,6 @@ from ..core.config import Env, Settings, StreamerConfig, apply_streamer_override
 from ..core.db import Database
 from ..core.events import ChatEvent, ClipCandidate, TwitchClip
 from ..core.logging import logger
-from ..editor.ai_analyzer import DeepSeekAnalyzer
-from ..editor.clip_edit_queue import ClipEditQueue
 from ..detector.chat_signals import CapsRatioTracker, RepetitionTracker, UniqueChattersTracker
 from ..detector.chat_velocity import ChatVelocityTracker
 from ..detector.emote_spam import EmoteDensityTracker
@@ -103,24 +103,20 @@ class HarvestPipeline:
         self._raw_dir.mkdir(parents=True, exist_ok=True)
         self._processed_dir.mkdir(parents=True, exist_ok=True)
 
-        if env.deepseek_api_key:
-            self.edit_queue: ClipEditQueue | None = ClipEditQueue(
-                analyzer=DeepSeekAnalyzer(env.deepseek_api_key),
-                editor=None,
-            )
-        else:
-            logger.warning("[harvest] DEEPSEEK_API_KEY absent — analyse IA désactivée")
-            self.edit_queue = None
-
     async def run(self) -> list[TwitchClip]:
         await self.db.init()
+        # Vérification système : streamlink doit être installé
+        if shutil.which("streamlink") is None:
+            logger.error("[harvest] streamlink introuvable dans le PATH — vérifier l'installation système")
+            logger.error("  https://streamlink.github.io/install.html")
+            self.stop()
+            return []
+
         self._session_id = await self.db.create_session(
             self.streamer.login, datetime.now(timezone.utc)
         )
         logger.info(f"[harvest] session #{self._session_id} ouverte pour {self.streamer.login}")
 
-        if self.edit_queue is not None:
-            await self.edit_queue.start()
         try:
             async with TwitchAPIClient(
                 self.env.twitch_client_id, self.env.twitch_client_secret
@@ -148,17 +144,15 @@ class HarvestPipeline:
                     t.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
         finally:
-            if self.edit_queue is not None:
-                await self.edit_queue.stop()
+            logger.info(f"[harvest] terminé — {len(self._collected)} clip(s) créé(s)")
+            if self._session_id is not None:
+                await self.db.close_session(self._session_id, datetime.now(timezone.utc))
+                stats = await self.db.get_session_stats(self._session_id)
+                logger.info(
+                    f"[harvest] session #{self._session_id} fermée — "
+                    f"{stats['clip_count']} clips | top score {stats['top_score']:.1f}"
+                )
 
-        logger.info(f"[harvest] terminé — {len(self._collected)} clip(s) créé(s)")
-        if self._session_id is not None:
-            await self.db.close_session(self._session_id, datetime.now(timezone.utc))
-            stats = await self.db.get_session_stats(self._session_id)
-            logger.info(
-                f"[harvest] session #{self._session_id} fermée — "
-                f"{stats['clip_count']} clips | top score {stats['top_score']:.1f}"
-            )
         return self._collected
 
     def stop(self) -> None:
@@ -300,7 +294,7 @@ class HarvestPipeline:
                 asyncio.create_task(self._clip_task(
                     api, broadcaster_id,
                     v_score, e_score, u_score, c_score, r_score, composite,
-                    candidate,
+                    candidate.category.value,
                 ))
 
     async def _clip_task(
@@ -313,7 +307,7 @@ class HarvestPipeline:
         c_score: float,
         r_score: float,
         composite: float,
-        candidate: ClipCandidate,
+        category: str,
     ) -> None:
         """Crée et récupère un clip en tâche de fond (non-bloquant pour le scorer)."""
         try:
@@ -360,6 +354,7 @@ class HarvestPipeline:
                 r_score=clip.r_score,
                 composite_score=clip.composite_score,
                 thumbnail_url=clip.thumbnail_url or None,
+                category=category,
             )
             logger.info(
                 f"[harvest] clip #{len(self._collected)} : "
@@ -371,9 +366,6 @@ class HarvestPipeline:
                 clip.local_path = str(local_path)
                 await self.db.update_clip_local_path(clip.id, clip.local_path)
                 logger.info(f"[download] sauvegardé → {clip.local_path}")
-
-            if self.edit_queue is not None:
-                self.edit_queue.push(clip, candidate)
 
             if self.broadcaster:
                 await self.broadcaster.emit_clip(clip)
