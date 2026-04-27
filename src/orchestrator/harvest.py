@@ -27,8 +27,10 @@ from typing import TYPE_CHECKING
 from ..api.twitch import TwitchAPIClient
 from ..core.config import Env, Settings, StreamerConfig, apply_streamer_overrides
 from ..core.db import Database
-from ..core.events import ChatEvent, TwitchClip
+from ..core.events import ChatEvent, ClipCandidate, TwitchClip
 from ..core.logging import logger
+from ..editor.ai_analyzer import DeepSeekAnalyzer
+from ..editor.clip_edit_queue import ClipEditQueue
 from ..detector.chat_signals import CapsRatioTracker, RepetitionTracker, UniqueChattersTracker
 from ..detector.chat_velocity import ChatVelocityTracker
 from ..detector.emote_spam import EmoteDensityTracker
@@ -101,6 +103,15 @@ class HarvestPipeline:
         self._raw_dir.mkdir(parents=True, exist_ok=True)
         self._processed_dir.mkdir(parents=True, exist_ok=True)
 
+        if env.deepseek_api_key:
+            self.edit_queue: ClipEditQueue | None = ClipEditQueue(
+                analyzer=DeepSeekAnalyzer(env.deepseek_api_key),
+                editor=None,
+            )
+        else:
+            logger.warning("[harvest] DEEPSEEK_API_KEY absent — analyse IA désactivée")
+            self.edit_queue = None
+
     async def run(self) -> list[TwitchClip]:
         await self.db.init()
         self._session_id = await self.db.create_session(
@@ -108,31 +119,37 @@ class HarvestPipeline:
         )
         logger.info(f"[harvest] session #{self._session_id} ouverte pour {self.streamer.login}")
 
-        async with TwitchAPIClient(
-            self.env.twitch_client_id, self.env.twitch_client_secret
-        ) as api:
-            stream = await api.require_live(self.streamer.login)
-            broadcaster_id: str = stream["user_id"]
-            started_at = datetime.fromisoformat(stream["started_at"].replace("Z", "+00:00"))
+        if self.edit_queue is not None:
+            await self.edit_queue.start()
+        try:
+            async with TwitchAPIClient(
+                self.env.twitch_client_id, self.env.twitch_client_secret
+            ) as api:
+                stream = await api.require_live(self.streamer.login)
+                broadcaster_id: str = stream["user_id"]
+                started_at = datetime.fromisoformat(stream["started_at"].replace("Z", "+00:00"))
 
-            logger.info(
-                f"[harvest] {self.streamer.login} est live depuis "
-                f"{started_at.astimezone(_PARIS).strftime('%H:%M:%S')} (Paris) — écoute du chat démarrée"
-            )
+                logger.info(
+                    f"[harvest] {self.streamer.login} est live depuis "
+                    f"{started_at.astimezone(_PARIS).strftime('%H:%M:%S')} (Paris) — écoute du chat démarrée"
+                )
 
-            chat_task = asyncio.create_task(self._run_chat(), name="chat")
-            tasks = [
-                chat_task,
-                asyncio.create_task(self._chat_consumer(), name="consumer"),
-                asyncio.create_task(self._scoring_loop(api, broadcaster_id), name="scorer"),
-                asyncio.create_task(self._liveness_loop(api), name="liveness"),
-                asyncio.create_task(self._watch_chat_task(chat_task), name="chat_watchdog"),
-            ]
+                chat_task = asyncio.create_task(self._run_chat(), name="chat")
+                tasks = [
+                    chat_task,
+                    asyncio.create_task(self._chat_consumer(), name="consumer"),
+                    asyncio.create_task(self._scoring_loop(api, broadcaster_id), name="scorer"),
+                    asyncio.create_task(self._liveness_loop(api), name="liveness"),
+                    asyncio.create_task(self._watch_chat_task(chat_task), name="chat_watchdog"),
+                ]
 
-            await self._stop.wait()
-            for t in tasks:
-                t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+                await self._stop.wait()
+                for t in tasks:
+                    t.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            if self.edit_queue is not None:
+                await self.edit_queue.stop()
 
         logger.info(f"[harvest] terminé — {len(self._collected)} clip(s) créé(s)")
         if self._session_id is not None:
@@ -283,6 +300,7 @@ class HarvestPipeline:
                 asyncio.create_task(self._clip_task(
                     api, broadcaster_id,
                     v_score, e_score, u_score, c_score, r_score, composite,
+                    candidate,
                 ))
 
     async def _clip_task(
@@ -295,6 +313,7 @@ class HarvestPipeline:
         c_score: float,
         r_score: float,
         composite: float,
+        candidate: ClipCandidate,
     ) -> None:
         """Crée et récupère un clip en tâche de fond (non-bloquant pour le scorer)."""
         try:
@@ -352,6 +371,9 @@ class HarvestPipeline:
                 clip.local_path = str(local_path)
                 await self.db.update_clip_local_path(clip.id, clip.local_path)
                 logger.info(f"[download] sauvegardé → {clip.local_path}")
+
+            if self.edit_queue is not None:
+                self.edit_queue.push(clip, candidate)
 
             if self.broadcaster:
                 await self.broadcaster.emit_clip(clip)

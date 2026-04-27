@@ -21,6 +21,7 @@ class Env(BaseSettings):
     twitch_user_token: str = ""        # token avec clips:edit (sans prefix oauth:)
 
     anthropic_api_key: str = ""
+    deepseek_api_key: str = ""
 
     data_dir: Path = Path("./data")
 

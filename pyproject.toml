@@ -21,7 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.5"]
 # phase 2+
-editor = ["faster-whisper>=1.0", "opencv-python>=4.10", "mediapipe>=0.10"]
+editor = ["faster-whisper>=1.0", "opencv-python>=4.10", "mediapipe>=0.10", "openai>=1.0"]
 ai = ["anthropic>=0.39"]
 
 [tool.ruff]
