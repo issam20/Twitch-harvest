@@ -332,7 +332,7 @@ def edit(
         from .editor.video_editor import VideoEditor
 
         analyzer = DeepSeekAnalyzer(env.deepseek_api_key)
-        editor = VideoEditor()
+        editor = VideoEditor(output_dir=env.data_dir / "edited")
 
         for i, row in enumerate(clips, 1):
             logger.info(f"[edit] {i}/{len(clips)} — {row['twitch_id']}")
@@ -359,11 +359,22 @@ def edit(
             )
 
             plan = await analyzer.analyze(twitch_clip, candidate)
-            await db.update_clip_edit_result(row["id"], plan.model_dump_json())
 
+            edited_path = None
             if plan.worth_editing and row.get("local_path"):
                 twitch_clip.local_path = row["local_path"]
-                await editor.render(twitch_clip, plan)
+                edited_path = await editor.render(twitch_clip, plan)
+
+            if edited_path:
+                await db.update_clip_edit_result(
+                    row["id"],
+                    plan.model_dump_json(),
+                    category=plan.category,
+                    processed_path=str(edited_path),
+                )
+                logger.info(f"[edit] ✓ render → {edited_path.name}")
+            else:
+                await db.update_clip_edit_result(row["id"], plan.model_dump_json())
 
     loop = asyncio.new_event_loop()
     try:

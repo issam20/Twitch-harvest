@@ -125,11 +125,21 @@ class Database:
             )
             await db.commit()
 
-    async def update_clip_edit_result(self, clip_id: int, edit_plan_json: str) -> None:
+    async def update_clip_edit_result(
+        self,
+        clip_id: int,
+        edit_plan_json: str,
+        category: str | None = None,
+        processed_path: str | None = None,
+    ) -> None:
         async with aiosqlite.connect(self.path) as db:
             await db.execute(
-                "UPDATE clips SET edit_plan_json = ? WHERE id = ?",
-                (edit_plan_json, clip_id),
+                """UPDATE clips
+                   SET edit_plan_json = ?,
+                       category = COALESCE(?, category),
+                       processed_path = COALESCE(?, processed_path)
+                   WHERE id = ?""",
+                (edit_plan_json, category, processed_path, clip_id),
             )
             await db.commit()
 
