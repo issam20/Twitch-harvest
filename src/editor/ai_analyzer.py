@@ -174,6 +174,8 @@ class DeepSeekAnalyzer:
                         {"role": "user", "content": user_prompt},
                     ],
                     "max_tokens": 800,
+                    # Force Non-Thinking mode : la réponse arrive dans content, pas reasoning_content
+                    "extra_body": {"thinking": {"type": "disabled"}},
                 }
                 # Reasoning models (deepseek-reasoner, o1, o3, etc.) don't support temperature
                 if not self._is_reasoning_model():
@@ -182,19 +184,14 @@ class DeepSeekAnalyzer:
                 response = await self._client.chat.completions.create(**kwargs)
                 choice = response.choices[0]
                 raw = choice.message.content or ""
-                finish = choice.finish_reason
-                # Les modèles reasoning mettent parfois le JSON dans reasoning_content
-                if not raw:
-                    raw = getattr(choice.message, "reasoning_content", None) or ""
-                    if raw:
-                        logger.debug("[analyzer] content vide → fallback reasoning_content")
-                if not raw:
+                if not raw.strip():
+                    reasoning = getattr(choice.message, "reasoning_content", "") or ""
                     logger.warning(
-                        f"[analyzer] tentative {attempt + 1}/3 : réponse vide "
-                        f"(finish={finish!r}, model={self._model!r})"
+                        f"[analyzer] content vide sur {clip.id!r} — "
+                        f"reasoning_content présent: {bool(reasoning)} | "
+                        f"début: {reasoning[:120]!r}"
                     )
-                    continue
-                logger.debug(f"[analyzer] finish_reason={finish!r} raw={raw[:200]!r}")
+                logger.debug(f"[analyzer] finish_reason={choice.finish_reason!r} raw={raw[:200]!r}")
                 # Extrait le premier bloc JSON valide meme si le modele ajoute du texte
                 start = raw.find("{")
                 end = raw.rfind("}") + 1
@@ -210,7 +207,10 @@ class DeepSeekAnalyzer:
                     logger.info(f"[analyzer] clip {clip.id} -> worth_editing=False (score trop bas)")
                 return plan
             except (json.JSONDecodeError, ValidationError) as exc:
-                logger.warning(f"[analyzer] tentative {attempt + 1}/3 echouee : {exc!r}")
+                logger.warning(
+                    f"[analyzer] parse échoué (tentative {attempt + 1}) — "
+                    f"raw={raw[:200]!r} — {exc!r}"
+                )
             except Exception as exc:
                 logger.warning(f"[analyzer] erreur API tentative {attempt + 1}/3 : {exc!r}")
 
