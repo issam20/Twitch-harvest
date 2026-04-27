@@ -87,6 +87,12 @@ class VideoEditor:
 
         font_path = FontManager.get_impact_path()
         font_name = FontManager.get_font_name()
+
+        # Copier la police dans tmp_dir : ffmpeg sera lancé avec cwd=tmp_dir
+        # et utilisera fontsdir=. → évite tout problème d'échappement Windows (C: dans le filtre)
+        font_tmp = tmp_dir / Path(font_path).name
+        shutil.copy2(font_path, font_tmp)
+
         renderer = CaptionRenderer(w, h, font_path, font_name)
 
         trim_start = plan.trim_start
@@ -102,7 +108,7 @@ class VideoEditor:
         renderer.build_ass(segments, plan.title, ass_path)
         logger.info(f"[editor] step 3/3 — burn captions : {len(segments)} segments ASS")
 
-        return await self._step_burn_captions(step2, output_path, ass_path, Path(font_path).parent)
+        return await self._step_burn_captions(step2, output_path, ass_path)
 
     async def _step_trim_and_crop(
         self,
@@ -192,30 +198,23 @@ class VideoEditor:
         input_path: Path,
         output_path: Path,
         ass_path: Path,
-        fonts_dir: Path,
     ) -> bool:
-        # Escaping du chemin pour le filtre ffmpeg (Windows : antislash → slash, colon → \:)
-        def _esc(p: Path) -> str:
-            s = str(p).replace("\\", "/")
-            # Escape le deux-points du lecteur Windows (ex: C:/ → C\:/)
-            if len(s) >= 2 and s[1] == ":":
-                s = s[0] + "\\:" + s[2:]
-            return s
-
-        ass_esc = _esc(ass_path)
-        fonts_esc = _esc(fonts_dir)
-        vf = f"ass={ass_esc}:fontsdir='{fonts_esc}'"
-
+        # Sur Windows, tout chemin absolu dans le filtre ass= contient "C:" qui casse le parser
+        # de filtres ffmpeg (: est le séparateur d'options).
+        # Solution : lancer ffmpeg depuis le répertoire du .ass (cwd) et utiliser des
+        # chemins relatifs dans le filtre → aucun deux-points problématique.
+        cwd = ass_path.parent
+        vf = f"ass={ass_path.name}:fontsdir=."
         args = [
             "ffmpeg", "-y",
-            "-i", str(input_path),
+            "-i", str(input_path.resolve()),
             "-vf", vf,
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
             "-c:a", "copy",
             "-movflags", "+faststart",
-            str(output_path),
+            str(output_path.resolve()),
         ]
-        return await self._run_ffmpeg(args, "burn_captions")
+        return await self._run_ffmpeg(args, "burn_captions", cwd=cwd)
 
     async def _ffprobe_video_info(self, path: Path) -> dict:
         """Retourne width, height, duration, fps via ffprobe JSON."""
@@ -251,7 +250,9 @@ class VideoEditor:
             logger.warning(f"[editor] ffprobe erreur : {exc!r}")
             return {}
 
-    async def _run_ffmpeg(self, args: list[str], step_name: str) -> bool:
+    async def _run_ffmpeg(
+        self, args: list[str], step_name: str, cwd: Path | None = None
+    ) -> bool:
         """Lance une commande ffmpeg. Retourne True si succès."""
         if not shutil.which("ffmpeg"):
             raise RuntimeError(
@@ -263,6 +264,7 @@ class VideoEditor:
                 *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                cwd=cwd,
             )
             _, stderr = await proc.communicate()
             if proc.returncode != 0:
