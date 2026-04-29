@@ -1,6 +1,6 @@
 # CONTEXT.md — Twitch Harvest
 
-> Généré automatiquement le **2026-04-29 21:06:13 UTC**
+> Généré automatiquement le **2026-04-29 21:13:32 UTC**
 > Ne pas éditer manuellement — mis à jour automatiquement à chaque push sur `main`.
 
 ## État du projet
@@ -2283,7 +2283,7 @@ testpaths = ["tests"]
 ```
 
 ### `src/main.py`
-_(tronqué à 300 lignes sur 392)_
+_(tronqué à 300 lignes sur 398)_
 
 ```python
 """Entrypoint CLI.
