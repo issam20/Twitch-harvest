@@ -8,9 +8,8 @@ from ..core.logging import logger
 
 class CaptionRenderer:
     # Couleurs ASS (format &HAABBGGRR)
-    WHITE  = "&H00FFFFFF"
-    BLACK  = "&H00000000"
-    RED    = "&H002400E8"   # #E8003C en BGR
+    WHITE = "&H00FFFFFF"
+    BLACK = "&H00000000"
 
     def __init__(
         self,
@@ -23,22 +22,21 @@ class CaptionRenderer:
         self.video_height = video_height
         self.font_path = font_path
         self.font_name = font_name
-        self.font_size = round(video_width * 0.148)
-        self.title_font_size = round(video_width * 0.055)
+        # Fix 2 : taille basée sur render_width (post-crop), min 48px
+        self.font_size = max(int(video_width * 0.148), 48)
         self.margin_v = round(video_height * 0.22)
-        self.title_margin_v = round(video_height * 0.02)
 
     def build_ass(
         self,
         segments: list[dict],   # [{"start": 0.0, "end": 1.2, "text": "ET PAR DES"}]
-        title: str,
+        title: str,             # conservé pour compatibilité API — titre rendu par drawtext
         output_path: Path,
     ) -> Path:
         """Génère le fichier .ass et le retourne."""
         lines: list[str] = []
         lines += self._header()
         lines += self._styles()
-        lines += self._events(segments, title)
+        lines += self._events(segments)
         output_path.write_text("\n".join(lines), encoding="utf-8")
         logger.debug(f"[captions] ASS généré : {output_path} ({len(segments)} segments)")
         return output_path
@@ -61,40 +59,30 @@ class CaptionRenderer:
             "Alignment, MarginL, MarginR, MarginV, Encoding"
         )
         mv = self.margin_v
-        tmv = self.title_margin_v
         fs = self.font_size
-        tfs = self.title_font_size
         fn = self.font_name
 
-        # BorderStyle 1 = outline+shadow, 3 = opaque box
+        # Normal : texte blanc, outline noir 4px, aligné haut-centre
         normal = (
             f"Style: Normal,{fn},{fs},"
             f"{self.WHITE},{self.WHITE},{self.BLACK},{self.BLACK},"
             f"-1,0,0,0,100,100,0,0,1,4,0,8,10,10,{mv},1"
         )
+        # Highlight : conservé pour compatibilité ; le vrai highlight passe par des tags inline
         highlight = (
             f"Style: Highlight,{fn},{fs},"
-            f"{self.WHITE},{self.WHITE},{self.BLACK},{self.RED},"
-            f"-1,0,0,0,100,100,0,0,3,0,0,8,10,10,{mv},1"
+            f"{self.WHITE},{self.WHITE},{self.BLACK},{self.BLACK},"
+            f"-1,0,0,0,100,100,0,0,1,4,0,8,10,10,{mv},1"
         )
-        title_style = (
-            f"Style: Title,{fn},{tfs},"
-            f"{self.BLACK},{self.BLACK},{self.BLACK},{self.WHITE},"
-            f"-1,0,0,0,100,100,0,0,3,0,0,8,10,10,{tmv},1"
-        )
-        return ["[V4+ Styles]", fmt, normal, highlight, title_style, ""]
+        return ["[V4+ Styles]", fmt, normal, highlight, ""]
 
-    def _events(self, segments: list[dict], title: str) -> list[str]:
+    def _events(self, segments: list[dict]) -> list[str]:
         fmt = "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
         lines = ["[Events]", fmt]
 
-        total_start = segments[0]["start"] if segments else 0.0
-        total_end = segments[-1]["end"] if segments else 1.0
-
-        if title:
-            t0 = self._format_ass_time(total_start)
-            t1 = self._format_ass_time(total_end)
-            lines.append(f"Dialogue: 0,{t0},{t1},Title,,0,0,0,,{title.upper()}")
+        # Fix 4 : highlight via tags inline ASS (pas de style swap qui casse le positionnement)
+        _HL_OPEN  = r"{\c&H002400E8&\3c&H002400E8&\bord0\shad0\be1\blur0}"
+        _HL_CLOSE = r"{\r}"
 
         for seg in segments:
             t0 = self._format_ass_time(seg["start"])
@@ -106,7 +94,7 @@ class CaptionRenderer:
             parts: list[str] = []
             for i, word in enumerate(words):
                 if i == strong_idx:
-                    parts.append(r"{\rHighlight}" + word + r"{\r}")
+                    parts.append(f"{_HL_OPEN}{word}{_HL_CLOSE}")
                 else:
                     parts.append(word)
             text = " ".join(parts)
@@ -114,12 +102,28 @@ class CaptionRenderer:
 
         return lines
 
+    def _fallback_segments(self, caption: str, duration: float) -> list[dict]:
+        """Fix 3 : découpe caption en chunks de 3 mots max distribués sur la durée."""
+        words = caption.upper().split()
+        if not words:
+            return [{"start": 0.0, "end": duration, "text": ""}]
+        chunks = [" ".join(words[i:i + 3]) for i in range(0, len(words), 3)]
+        time_per_chunk = duration / len(chunks)
+        return [
+            {
+                "start": i * time_per_chunk,
+                "end": (i + 1) * time_per_chunk,
+                "text": chunk,
+            }
+            for i, chunk in enumerate(chunks)
+        ]
+
     def _split_into_segments(
         self,
         words: list[dict],  # [{"word": "ET", "start": 0.0, "end": 0.3}]
         max_words: int = 3,
     ) -> list[dict]:
-        """Regroupe les mots en segments de max_words, coupe sur les pauses > 0.4s."""
+        """Fix 6 : regroupe les mots Whisper en segments de max_words, coupe sur pauses > 0.4s."""
         if not words:
             return []
 
@@ -151,7 +155,7 @@ class CaptionRenderer:
         """Retourne l'index du mot fort.
 
         Priorité :
-        1. Mot en majuscules dans le texte original
+        1. Mot en majuscules dans le texte original (mixed case uniquement)
         2. Dernier mot du segment
         """
         for i, w in enumerate(words):

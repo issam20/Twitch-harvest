@@ -1,4 +1,4 @@
-"""VideoEditor — pipeline ffmpeg : trim, color grade, sous-titres ASS TikTok."""
+"""VideoEditor — pipeline : trim+crop 9:16 (ffmpeg) → transcription (Whisper) → rendu (Remotion)."""
 from __future__ import annotations
 
 import asyncio
@@ -7,18 +7,29 @@ import shutil
 import tempfile
 from pathlib import Path
 
+from ..core.config import EditorConfig
 from ..core.events import TwitchClip
 from ..core.logging import logger
 from .ai_analyzer import EditPlan
-from .caption_renderer import CaptionRenderer
-from .font_manager import FontManager
+from .transcriber import Transcriber
+
+# Répertoire racine du projet Remotion (deux niveaux au-dessus de ce fichier)
+_REMOTION_DIR = Path(__file__).parent.parent.parent / "remotion"
+_RENDER_SCRIPT = _REMOTION_DIR / "scripts" / "render.mjs"
+
+HIGHLIGHT_COLOR = "#E8003C"
 
 
 class VideoEditor:
     OUTPUT_SUFFIX = "_edited.mp4"
 
-    def __init__(self, output_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        output_dir: Path | None = None,
+        settings: EditorConfig | None = None,
+    ) -> None:
         self.output_dir = output_dir
+        self._whisper_model = settings.whisper_model if settings else "medium"
 
     async def render(
         self,
@@ -38,24 +49,31 @@ class VideoEditor:
 
         base_dir = self.output_dir or input_path.parent
         base_dir.mkdir(parents=True, exist_ok=True)
-
-        output_path = base_dir / (input_path.stem + self.OUTPUT_SUFFIX)
-        suffix = 1
-        while output_path.exists():
-            output_path = base_dir / f"{input_path.stem}{self.OUTPUT_SUFFIX[:-4]}_{suffix}.mp4"
-            suffix += 1
+        output_path = self._unique_output(base_dir, input_path.stem)
 
         tmp_dir = Path(tempfile.mkdtemp(prefix="harvest_render_"))
         try:
-            ok = await self._render_pipeline(input_path, output_path, plan, transcript_words, tmp_dir)
+            ok = await self._render_pipeline(
+                input_path, output_path, plan, transcript_words, tmp_dir
+            )
+        except asyncio.CancelledError:
+            logger.info(f"[editor] render annulé pour {clip.id!r}")
+            raise
+        except Exception as exc:
+            logger.warning(f"[editor] erreur inattendue : {exc!r}")
+            return None
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
         if ok:
-            logger.info(f"[editor] ✓ render terminé → {output_path.name}")
+            logger.info(f"[editor] ✓ rendu terminé → {output_path.name}")
             return output_path
         logger.warning(f"[editor] render échoué pour {clip.id!r}")
         return None
+
+    # ------------------------------------------------------------------
+    # Pipeline interne
+    # ------------------------------------------------------------------
 
     async def _render_pipeline(
         self,
@@ -65,79 +83,93 @@ class VideoEditor:
         transcript_words: list[dict] | None,
         tmp_dir: Path,
     ) -> bool:
-        video_info = await self._ffprobe_video_info(input_path)
+        # --- Step 1: ffmpeg trim + crop 9:16 ---
+        video_info = await self._ffprobe(input_path)
         if not video_info:
             return False
 
-        step1 = tmp_dir / "step1_trim_crop.mp4"
-        step2 = tmp_dir / "step2_grade.mp4"
-        ass_path = tmp_dir / "captions.ass"
-
-        logger.info(f"[editor] step 1/3 — trim + crop : {input_path.name}")
-        if not await self._step_trim_and_crop(input_path, step1, plan, video_info):
+        step1 = tmp_dir / "step1.mp4"
+        if not await self._step_trim_crop(input_path, step1, plan, video_info):
             return False
 
-        logger.info(f"[editor] step 2/3 — color grade : {plan.color_grade}")
-        if not await self._step_color_grade(step1, step2, plan.color_grade):
+        # Dimensions réelles du fichier croppé (source de vérité pour Remotion)
+        cropped_info = await self._ffprobe(step1)
+        if not cropped_info:
             return False
 
-        graded_info = await self._ffprobe_video_info(step2)
-        w = graded_info.get("width", video_info["width"])
-        h = graded_info.get("height", video_info["height"])
+        w = cropped_info["width"]
+        h = cropped_info["height"]
+        fps = round(cropped_info["fps"])           # Remotion exige un entier
+        duration = cropped_info["duration"]
+        duration_in_frames = max(1, round(duration * fps))
 
-        font_path = FontManager.get_impact_path()
-        font_name = FontManager.get_font_name()
+        logger.info(
+            f"[ffmpeg] crop: {video_info['width']}x{video_info['height']} → {w}x{h} "
+            f"| {duration:.2f}s @ {fps}fps ({duration_in_frames} frames)"
+        )
 
-        # Copier la police dans tmp_dir : ffmpeg sera lancé avec cwd=tmp_dir
-        # et utilisera fontsdir=. → évite tout problème d'échappement Windows (C: dans le filtre)
-        font_tmp = tmp_dir / Path(font_path).name
-        shutil.copy2(font_path, font_tmp)
-
-        renderer = CaptionRenderer(w, h, font_path, font_name)
-
-        trim_start = plan.trim_start
-        trim_end = plan.trim_end if plan.trim_end > plan.trim_start else video_info.get("duration", 30.0)
-        trim_duration = trim_end - trim_start
-
-        if transcript_words:
-            segments = renderer._split_into_segments(transcript_words)
+        # --- Step 2: transcription Whisper ---
+        if transcript_words is not None:
+            words = transcript_words
+            logger.info(f"[whisper] {len(words)} mots (fournis externalement)")
         else:
-            caption_text = plan.caption.upper() if plan.caption else plan.title.upper()
-            segments = [{"start": 0.0, "end": trim_duration, "text": caption_text}]
+            try:
+                words = await Transcriber(self._whisper_model).transcribe(step1)
+            except RuntimeError as exc:
+                logger.warning(f"[whisper] {exc} — fallback segments")
+                words = []
 
-        renderer.build_ass(segments, plan.title, ass_path)
-        logger.info(f"[editor] step 3/3 — burn captions : {len(segments)} segments ASS")
+        if not words:
+            words = self._fallback_words(plan, duration)
+            logger.info(f"[whisper] {len(words)} mots synthétiques (fallback)")
 
-        return await self._step_burn_captions(step2, output_path, ass_path)
+        # --- Step 3: rendu Remotion ---
+        # output_path peut être relatif si data_dir l'est (Path("./data")) ;
+        # Node.js path.resolve() le résoudrait depuis cwd=remotion/ → mauvais endroit.
+        config = {
+            "publicDir": str(tmp_dir),
+            "outputPath": str(output_path.resolve()),
+            "inputProps": {
+                "videoSrc": "step1.mp4",
+                "title": plan.title,
+                "colorGrade": plan.color_grade,
+                "addZoom": plan.add_zoom,
+                "words": words,
+                "highlightColor": HIGHLIGHT_COLOR,
+                "durationInFrames": duration_in_frames,
+                "fps": fps,
+                "width": w,
+                "height": h,
+            },
+        }
+        config_path = tmp_dir / "render_config.json"
+        config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
 
-    async def _step_trim_and_crop(
+        return await self._step_remotion(config_path)
+
+    async def _step_trim_crop(
         self,
         input_path: Path,
-        temp_path: Path,
+        output_path: Path,
         plan: EditPlan,
         video_info: dict,
     ) -> bool:
         w = video_info["width"]
         h = video_info["height"]
-
         trim_start = plan.trim_start
-        trim_end = plan.trim_end if plan.trim_end > plan.trim_start else video_info.get("duration", 30.0)
+        trim_end = (
+            plan.trim_end
+            if plan.trim_end > plan.trim_start
+            else video_info.get("duration", 30.0)
+        )
         duration = trim_end - trim_start
 
         filters: list[str] = []
-
-        # Recadrage 9:16 si la source n'est pas déjà 9:16
-        aspect = w / h if h else 1.0
-        if abs(aspect - 9 / 16) > 0.01:
+        source_ratio = w / h if h else 1.0
+        if abs(source_ratio - 9 / 16) > 0.05:
             target_w = h * 9 // 16
             crop_x = (w - target_w) // 2
             filters.append(f"crop={target_w}:{h}:{crop_x}:0")
-
-        if plan.add_zoom:
-            filters.append(
-                "zoompan=z='min(zoom+0.0015,1.08)':d=1"
-                ":x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':fps=30"
-            )
 
         base_args = [
             "ffmpeg", "-y",
@@ -149,74 +181,77 @@ class VideoEditor:
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
             "-c:a", "aac", "-b:a", "160k",
             "-movflags", "+faststart",
-            str(temp_path),
+            str(output_path),
         ]
-
-        if filters:
-            args = base_args + ["-vf", ",".join(filters)] + encode_args
-        else:
-            args = base_args + encode_args
-
+        args = base_args + (["-vf", ",".join(filters)] if filters else []) + encode_args
         return await self._run_ffmpeg(args, "trim+crop")
 
-    async def _step_color_grade(
-        self,
-        input_path: Path,
-        temp_path: Path,
-        color_grade: str,
-    ) -> bool:
-        if color_grade == "raw":
-            args = ["ffmpeg", "-y", "-i", str(input_path), "-c", "copy", str(temp_path)]
-        elif color_grade == "cinematic":
-            vf = (
-                "eq=saturation=0.85:contrast=1.05,"
-                "curves=r='0/0 0.5/0.45 1/0.9':"
-                "g='0/0 0.5/0.48 1/0.92':"
-                "b='0/0 0.5/0.52 1/1.0'"
+    async def _step_remotion(self, config_path: Path) -> bool:
+        """Lance le rendu Remotion via Node.js."""
+        node = shutil.which("node")
+        if not node:
+            raise RuntimeError(
+                "node introuvable dans le PATH — installer Node.js : https://nodejs.org"
             )
-            args = [
-                "ffmpeg", "-y", "-i", str(input_path),
-                "-vf", vf,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-                "-c:a", "copy", "-movflags", "+faststart",
-                str(temp_path),
-            ]
-        else:  # "viral"
-            vf = "eq=saturation=1.3:contrast=1.1:brightness=0.03"
-            args = [
-                "ffmpeg", "-y", "-i", str(input_path),
-                "-vf", vf,
-                "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-                "-c:a", "copy", "-movflags", "+faststart",
-                str(temp_path),
-            ]
+        if not _REMOTION_DIR.exists():
+            raise RuntimeError(
+                f"Projet Remotion introuvable : {_REMOTION_DIR}\n"
+                "Lancer depuis la racine du projet : cd remotion && npm install"
+            )
+        if not (_REMOTION_DIR / "node_modules").exists():
+            raise RuntimeError(
+                f"node_modules absent dans {_REMOTION_DIR}\n"
+                "Lancer : cd remotion && npm install"
+            )
 
-        return await self._run_ffmpeg(args, f"color_grade:{color_grade}")
+        args = [node, str(_RENDER_SCRIPT), str(config_path)]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=_REMOTION_DIR,
+            )
+            stdout, stderr = await proc.communicate()
+            for line in stdout.decode(errors="replace").splitlines():
+                if line.strip():
+                    logger.info(line)
+            if proc.returncode != 0:
+                logger.warning(
+                    f"[remotion] rc={proc.returncode}\n"
+                    f"{stderr.decode(errors='replace')[-1200:]}"
+                )
+                return False
+            return True
+        except Exception as exc:
+            logger.warning(f"[remotion] erreur subprocess : {exc!r}")
+            return False
 
-    async def _step_burn_captions(
-        self,
-        input_path: Path,
-        output_path: Path,
-        ass_path: Path,
-    ) -> bool:
-        # Sur Windows, tout chemin absolu dans le filtre ass= contient "C:" qui casse le parser
-        # de filtres ffmpeg (: est le séparateur d'options).
-        # Solution : lancer ffmpeg depuis le répertoire du .ass (cwd) et utiliser des
-        # chemins relatifs dans le filtre → aucun deux-points problématique.
-        cwd = ass_path.parent
-        vf = f"ass={ass_path.name}:fontsdir=."
-        args = [
-            "ffmpeg", "-y",
-            "-i", str(input_path.resolve()),
-            "-vf", vf,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
-            "-c:a", "copy",
-            "-movflags", "+faststart",
-            str(output_path.resolve()),
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _fallback_words(self, plan: EditPlan, duration: float) -> list[dict]:
+        """Génère des mots synthétiques depuis plan.caption / plan.title."""
+        text = plan.caption if plan.caption else plan.title
+        raw_words = text.upper().split()
+        if not raw_words:
+            return [{"word": "...", "start": 0.0, "end": duration}]
+        time_per_word = duration / len(raw_words)
+        return [
+            {"word": w, "start": round(i * time_per_word, 3), "end": round((i + 1) * time_per_word, 3)}
+            for i, w in enumerate(raw_words)
         ]
-        return await self._run_ffmpeg(args, "burn_captions", cwd=cwd)
 
-    async def _ffprobe_video_info(self, path: Path) -> dict:
+    def _unique_output(self, base_dir: Path, stem: str) -> Path:
+        output = base_dir / (stem + self.OUTPUT_SUFFIX)
+        i = 1
+        while output.exists():
+            output = base_dir / f"{stem}{self.OUTPUT_SUFFIX[:-4]}_{i}.mp4"
+            i += 1
+        return output
+
+    async def _ffprobe(self, path: Path) -> dict:
         """Retourne width, height, duration, fps via ffprobe JSON."""
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -250,10 +285,7 @@ class VideoEditor:
             logger.warning(f"[editor] ffprobe erreur : {exc!r}")
             return {}
 
-    async def _run_ffmpeg(
-        self, args: list[str], step_name: str, cwd: Path | None = None
-    ) -> bool:
-        """Lance une commande ffmpeg. Retourne True si succès."""
+    async def _run_ffmpeg(self, args: list[str], step_name: str) -> bool:
         if not shutil.which("ffmpeg"):
             raise RuntimeError(
                 "ffmpeg introuvable dans le PATH — "
@@ -264,16 +296,15 @@ class VideoEditor:
                 *args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                cwd=cwd,
             )
             _, stderr = await proc.communicate()
             if proc.returncode != 0:
                 logger.warning(
-                    f"[editor] ffmpeg [{step_name}] rc={proc.returncode}\n"
+                    f"[ffmpeg] [{step_name}] rc={proc.returncode}\n"
                     f"{stderr.decode(errors='replace')[-600:]}"
                 )
                 return False
             return True
         except Exception as exc:
-            logger.warning(f"[editor] ffmpeg [{step_name}] erreur : {exc!r}")
+            logger.warning(f"[ffmpeg] [{step_name}] erreur : {exc!r}")
             return False

@@ -287,6 +287,7 @@ def edit(
     """Analyse les clips d'une session avec DeepSeek et génère les Edit Plans."""
     setup_logging(level=log_level)
     env = Env()
+    settings = load_settings(config_path)
 
     async def _run() -> None:
         db = Database(env.data_dir / "state.db")
@@ -332,7 +333,7 @@ def edit(
         from .editor.video_editor import VideoEditor
 
         analyzer = DeepSeekAnalyzer(env.deepseek_api_key)
-        editor = VideoEditor(output_dir=env.data_dir / "edited")
+        editor = VideoEditor(output_dir=env.data_dir / "edited", settings=settings.editor)
 
         for i, row in enumerate(clips, 1):
             logger.info(f"[edit] {i}/{len(clips)} — {row['twitch_id']}")

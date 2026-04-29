@@ -22,8 +22,12 @@ env/
 *.mp4
 *.mkv
 *.webm
-*.ts
+*.m2ts
 *.m4v
+
+# Node / Remotion
+remotion/node_modules/
+remotion/dist/
 
 # IDE / local
 .claude/
