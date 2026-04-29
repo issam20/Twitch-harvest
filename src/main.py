@@ -331,9 +331,15 @@ def edit(
 
         from .editor.ai_analyzer import DeepSeekAnalyzer
         from .editor.video_editor import VideoEditor
+        from .publisher import TelegramNotifier
 
         analyzer = DeepSeekAnalyzer(env.deepseek_api_key)
-        editor = VideoEditor(output_dir=env.data_dir / "edited", settings=settings.editor)
+        notifier = (
+            TelegramNotifier(env.telegram_bot_token, env.telegram_chat_id)
+            if env.telegram_bot_token
+            else None
+        )
+        editor = VideoEditor(output_dir=env.data_dir / "edited", settings=settings.editor, notifier=notifier)
 
         for i, row in enumerate(clips, 1):
             logger.info(f"[edit] {i}/{len(clips)} — {row['twitch_id']}")
