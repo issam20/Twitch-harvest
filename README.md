@@ -89,6 +89,35 @@ Générer `TWITCH_USER_TOKEN` via Device Flow intégré :
 python -m src.main auth
 ```
 
+### Notifications Telegram (optionnel)
+
+Après chaque render réussi, le bot envoie automatiquement le MP4 + métadonnées.
+
+**1. Créer le bot**
+
+```
+@BotFather sur Telegram → /newbot → copier le token
+```
+
+**2. Récupérer le `chat_id`**
+
+Envoyer un message au bot, puis :
+
+```bash
+curl https://api.telegram.org/bot<TOKEN>/getUpdates
+# → "chat": {"id": 123456789, ...}
+```
+
+**3. Renseigner le `.env`**
+
+```env
+TELEGRAM_BOT_TOKEN=123456789:AAF...
+TELEGRAM_CHAT_ID=123456789
+```
+
+Si `TELEGRAM_BOT_TOKEN` est absent ou vide, les notifications sont silencieusement ignorées.
+Fichiers > 50 MB : le bot envoie un message texte avec le chemin local à la place du fichier.
+
 ### Tuning (`config/settings.yaml`)
 
 ```yaml

@@ -23,6 +23,9 @@ class Env(BaseSettings):
     anthropic_api_key: str = ""
     deepseek_api_key: str = ""
 
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+
     data_dir: Path = Path("./data")
 
 
