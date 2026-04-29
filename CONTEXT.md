@@ -1,6 +1,6 @@
 # CONTEXT.md — Twitch Harvest
 
-> Généré automatiquement le **2026-04-29 12:09:32 UTC**
+> Généré automatiquement le **2026-04-29 21:06:13 UTC**
 > Ne pas éditer manuellement — mis à jour automatiquement à chaque push sur `main`.
 
 ## État du projet
@@ -82,6 +82,9 @@ class Env(BaseSettings):
 
     anthropic_api_key: str = ""
     deepseek_api_key: str = ""
+
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
 
     data_dir: Path = Path("./data")
 
@@ -1540,12 +1543,16 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from ..core.config import EditorConfig
 from ..core.events import TwitchClip
 from ..core.logging import logger
 from .ai_analyzer import EditPlan
 from .transcriber import Transcriber
+
+if TYPE_CHECKING:
+    from ..publisher.telegram_notifier import TelegramNotifier
 
 # Répertoire racine du projet Remotion (deux niveaux au-dessus de ce fichier)
 _REMOTION_DIR = Path(__file__).parent.parent.parent / "remotion"
@@ -1561,9 +1568,11 @@ class VideoEditor:
         self,
         output_dir: Path | None = None,
         settings: EditorConfig | None = None,
+        notifier: TelegramNotifier | None = None,
     ) -> None:
         self.output_dir = output_dir
         self._whisper_model = settings.whisper_model if settings else "medium"
+        self._notifier = notifier
 
     async def render(
         self,
@@ -1601,6 +1610,11 @@ class VideoEditor:
 
         if ok:
             logger.info(f"[editor] ✓ rendu terminé → {output_path.name}")
+            if self._notifier is not None:
+                try:
+                    await self._notifier.notify(output_path, plan, clip)
+                except Exception as exc:
+                    logger.error(f"[editor] notifier inattendu : {exc!r}")
             return output_path
         logger.warning(f"[editor] render échoué pour {clip.id!r}")
         return None
