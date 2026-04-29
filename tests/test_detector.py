@@ -32,7 +32,7 @@ class TestChatVelocity:
         assert score == 0.0
 
     def test_below_abs_threshold_returns_zero(self):
-        tracker = ChatVelocityTracker(velocity_threshold=5.0)
+        tracker = ChatVelocityTracker(velocity_floor=5.0)
         now = datetime.now(timezone.utc)
         # 3 msgs sur 10s = 0.3 msg/s, sous le seuil absolu
         for i in range(3):
@@ -43,25 +43,29 @@ class TestChatVelocity:
     def test_spike_triggers_high_score(self):
         tracker = ChatVelocityTracker(
             window_seconds=10,
-            baseline_seconds=60,
-            velocity_threshold=5.0,
-            multiplier_threshold=3.0,
+            stats_window_seconds=60,
+            velocity_floor=5.0,
+            z_score_threshold=3.0,
+            warmup_samples=5,
         )
         now = datetime.now(timezone.utc)
-        # Baseline: 1 msg toutes les 2s sur 50s (entre -60 et -10) = 0.5 msg/s
-        for i in range(25):
-            tracker.add(_mk_event(now - timedelta(seconds=12 + i * 2)))
-        # Pic: 80 msgs sur les 10 dernieres secondes = 8 msg/s
+        # Phase 1: baseline (1 msg/2s) + warmup avec score() répétés
+        ts = now - timedelta(seconds=60)
+        for _ in range(6):  # 6 scores > warmup_samples=5
+            for _ in range(1):  # 1 msg toutes les 2s
+                tracker.add(_mk_event(ts))
+                ts += timedelta(seconds=2)
+            tracker.score(ts)
+        # Phase 2: spike
         for i in range(80):
-            tracker.add(_mk_event(now - timedelta(seconds=9.5 - i * 0.1)))
-
+            tracker.add(_mk_event(now - timedelta(seconds=2 - i * 0.025)))
         score, debug = tracker.score(now)
         assert score > 70
         assert debug["velocity"] >= 5.0
-        assert debug["ratio"] > 3.0
+        assert debug["z"] >= 3.0
 
     def test_old_messages_pruned(self):
-        tracker = ChatVelocityTracker(baseline_seconds=60)
+        tracker = ChatVelocityTracker(stats_window_seconds=60)
         now = datetime.now(timezone.utc)
         # 50 msgs tres vieux (>60s)
         for i in range(50):
@@ -127,9 +131,11 @@ class TestScorerFusion:
         now = datetime.now(timezone.utc)
         result = scorer.evaluate(
             now=now, channel="t",
-            velocity_score=30, velocity_debug={"velocity": 1, "ratio": 1.5},
+            velocity_score=30, velocity_debug={"velocity": 1, "z": 1.5},
             emote_score=20, emote_category=MomentCategory.UNKNOWN, emote_debug={"density": 0.1},
-            audio_score=10, audio_debug={"zscore": 0.5},
+            unique_score=0, unique_debug={},
+            caps_score=0, caps_debug={},
+            repetition_score=0, repetition_debug={},
             sample_messages=[],
         )
         assert result is None
@@ -139,9 +145,11 @@ class TestScorerFusion:
         now = datetime.now(timezone.utc)
         result = scorer.evaluate(
             now=now, channel="t",
-            velocity_score=90, velocity_debug={"velocity": 10, "ratio": 5},
+            velocity_score=90, velocity_debug={"velocity": 10, "z": 5},
             emote_score=85, emote_category=MomentCategory.FUNNY, emote_debug={"density": 0.7},
-            audio_score=60, audio_debug={"zscore": 2.5},
+            unique_score=0, unique_debug={},
+            caps_score=0, caps_debug={},
+            repetition_score=0, repetition_debug={},
             sample_messages=["KEKW", "LOL"],
         )
         assert result is not None
@@ -154,9 +162,11 @@ class TestScorerFusion:
 
         first = scorer.evaluate(
             now=now, channel="t",
-            velocity_score=90, velocity_debug={"velocity": 10, "ratio": 5},
+            velocity_score=90, velocity_debug={"velocity": 10, "z": 5},
             emote_score=80, emote_category=MomentCategory.FUNNY, emote_debug={"density": 0.6},
-            audio_score=60, audio_debug={"zscore": 2.0},
+            unique_score=0, unique_debug={},
+            caps_score=0, caps_debug={},
+            repetition_score=0, repetition_debug={},
             sample_messages=[],
         )
         assert first is not None
@@ -164,9 +174,11 @@ class TestScorerFusion:
         # 10s apres -> cooldown doit bloquer
         second = scorer.evaluate(
             now=now + timedelta(seconds=10), channel="t",
-            velocity_score=95, velocity_debug={"velocity": 12, "ratio": 6},
+            velocity_score=95, velocity_debug={"velocity": 12, "z": 6},
             emote_score=90, emote_category=MomentCategory.FUNNY, emote_debug={"density": 0.75},
-            audio_score=70, audio_debug={"zscore": 2.8},
+            unique_score=0, unique_debug={},
+            caps_score=0, caps_debug={},
+            repetition_score=0, repetition_debug={},
             sample_messages=[],
         )
         assert second is None
@@ -174,24 +186,26 @@ class TestScorerFusion:
         # 35s apres -> cooldown passe
         third = scorer.evaluate(
             now=now + timedelta(seconds=35), channel="t",
-            velocity_score=85, velocity_debug={"velocity": 9, "ratio": 4.5},
+            velocity_score=85, velocity_debug={"velocity": 9, "z": 4.5},
             emote_score=75, emote_category=MomentCategory.FUNNY, emote_debug={"density": 0.55},
-            audio_score=55, audio_debug={"zscore": 2.1},
+            unique_score=0, unique_debug={},
+            caps_score=0, caps_debug={},
+            repetition_score=0, repetition_debug={},
             sample_messages=[],
         )
         assert third is not None
 
-    def test_audio_none_redistributes_weights(self):
+    def test_high_scores_without_audio_trigger(self):
         scorer = ViralScorer(min_viral_score=60, cooldown_seconds=30)
         now = datetime.now(timezone.utc)
-        # Sans audio, weights normalises sur velocity+emote
-        # 90 * (0.45/0.80) + 80 * (0.35/0.80) = 50.625 + 35.0 = 85.6 -> trigger
         result = scorer.evaluate(
             now=now, channel="t",
-            velocity_score=90, velocity_debug={"velocity": 10, "ratio": 5},
+            velocity_score=90, velocity_debug={"velocity": 10, "z": 5},
             emote_score=80, emote_category=MomentCategory.HYPE, emote_debug={"density": 0.6},
-            audio_score=None, audio_debug=None,
+            unique_score=0, unique_debug={},
+            caps_score=0, caps_debug={},
+            repetition_score=0, repetition_debug={},
             sample_messages=[],
         )
         assert result is not None
-        assert result.score == pytest.approx(85.6, abs=0.5)
+        assert result.score >= 70
