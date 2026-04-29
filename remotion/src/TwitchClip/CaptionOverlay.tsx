@@ -1,7 +1,30 @@
 import { AbsoluteFill, useCurrentFrame, useVideoConfig } from "remotion";
 import { createTikTokStyleCaptions, parseSrt } from "@remotion/captions";
+import type { TikTokPage } from "@remotion/captions";
 import type { FC } from "react";
 import { COLORS, FONTS } from "./styles";
+
+const MAX_WORDS_PER_PAGE = 3;
+
+function splitToMaxWords(pages: TikTokPage[]): TikTokPage[] {
+  const result: TikTokPage[] = [];
+  for (const page of pages) {
+    if (page.tokens.length <= MAX_WORDS_PER_PAGE) {
+      result.push(page);
+      continue;
+    }
+    for (let i = 0; i < page.tokens.length; i += MAX_WORDS_PER_PAGE) {
+      const chunk = page.tokens.slice(i, i + MAX_WORDS_PER_PAGE);
+      result.push({
+        text: chunk.map((t) => t.text).join(" "),
+        startMs: chunk[0].fromMs,
+        tokens: chunk,
+        durationMs: chunk[chunk.length - 1].toMs - chunk[0].fromMs,
+      });
+    }
+  }
+  return result;
+}
 
 interface Props {
   srtContent: string;
@@ -14,12 +37,12 @@ export const CaptionOverlay: FC<Props> = ({ srtContent, width, height }) => {
   const { fps } = useVideoConfig();
   const timeMs = (frame / fps) * 1000;
 
-  // FIX 4 — groupement : 500 ms max entre tokens d'une même page
   const { captions } = parseSrt({ input: srtContent });
-  const { pages } = createTikTokStyleCaptions({
+  const { pages: rawPages } = createTikTokStyleCaptions({
     captions,
     combineTokensWithinMilliseconds: 500,
   });
+  const pages = splitToMaxWords(rawPages);
 
   const currentPage =
     pages.find(
