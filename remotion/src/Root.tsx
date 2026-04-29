@@ -1,7 +1,7 @@
 import { Composition } from "remotion";
 import type { CalculateMetadataFunction } from "remotion";
 import type { ComponentType, FC } from "react";
-import { TikTokClip } from "./TikTokClip";
+import { TwitchClip as TikTokClip } from "./TwitchClip";
 import type { TikTokClipProps } from "./types";
 
 type AnyProps = Record<string, unknown>;
