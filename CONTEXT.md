@@ -1,6 +1,6 @@
 # CONTEXT.md — Twitch Harvest
 
-> Généré automatiquement le **2026-04-29 11:42:52 UTC**
+> Généré automatiquement le **2026-04-29 11:55:55 UTC**
 > Ne pas éditer manuellement — mis à jour automatiquement à chaque push sur `main`.
 
 ## État du projet
@@ -1870,6 +1870,269 @@ export interface TikTokClipProps {
 }
 ```
 
+### `remotion/src/TwitchClip/index.tsx`
+
+```tsx
+import {
+  AbsoluteFill,
+  interpolate,
+  OffthreadVideo,
+  staticFile,
+  useCurrentFrame,
+  useVideoConfig,
+} from "remotion";
+import type { FC } from "react";
+import type { TikTokClipProps, WordSegment } from "../types";
+import { colorGradeFilter } from "./styles";
+import { TitleOverlay } from "./TitleOverlay";
+import { CaptionOverlay } from "./CaptionOverlay";
+
+// Convertit les mots Whisper [{word, start, end}] en contenu SRT
+// pour @remotion/captions parseSrt()
+function wordsToSrt(words: WordSegment[]): string {
+  return words
+    .map((w, i) => {
+      const start = msToSrtTimestamp(Math.round(w.start * 1000));
+      const end = msToSrtTimestamp(Math.round(w.end * 1000));
+      return `${i + 1}\n${start} --> ${end}\n${w.word}`;
+    })
+    .join("\n\n");
+}
+
+function msToSrtTimestamp(ms: number): string {
+  const h = Math.floor(ms / 3_600_000);
+  const m = Math.floor((ms % 3_600_000) / 60_000);
+  const s = Math.floor((ms % 60_000) / 1_000);
+  const rest = ms % 1_000;
+  return (
+    String(h).padStart(2, "0") +
+    ":" +
+    String(m).padStart(2, "0") +
+    ":" +
+    String(s).padStart(2, "0") +
+    "," +
+    String(rest).padStart(3, "0")
+  );
+}
+
+export const TwitchClip: FC<TikTokClipProps> = ({
+  videoSrc,
+  title,
+  colorGrade,
+  addZoom,
+  words,
+}) => {
+  const frame = useCurrentFrame();
+  const { fps, durationInFrames, width, height } = useVideoConfig();
+
+  const cssFilter = colorGradeFilter(colorGrade);
+  const scale = addZoom
+    ? interpolate(frame, [0, durationInFrames], [1.0, 1.08], {
+        extrapolateRight: "clamp",
+      })
+    : 1.0;
+
+  const srtContent = wordsToSrt(words);
+
+  return (
+    <AbsoluteFill style={{ backgroundColor: "black" }}>
+      {/* Vidéo de base avec color grade + zoom */}
+      <AbsoluteFill
+        style={{
+          transform: `scale(${scale})`,
+          filter: cssFilter,
+          transformOrigin: "center center",
+        }}
+      >
+        <OffthreadVideo src={staticFile(videoSrc)} />
+      </AbsoluteFill>
+
+      <TitleOverlay title={title} width={width} height={height} />
+      <CaptionOverlay srtContent={srtContent} width={width} height={height} />
+    </AbsoluteFill>
+  );
+};
+```
+
+### `remotion/src/TwitchClip/CaptionOverlay.tsx`
+
+```tsx
+import { AbsoluteFill, useCurrentFrame, useVideoConfig } from "remotion";
+import { createTikTokStyleCaptions, parseSrt } from "@remotion/captions";
+import type { FC } from "react";
+import { COLORS, FONTS } from "./styles";
+
+interface Props {
+  srtContent: string;
+  width: number;
+  height: number;
+}
+
+export const CaptionOverlay: FC<Props> = ({ srtContent, width, height }) => {
+  const frame = useCurrentFrame();
+  const { fps } = useVideoConfig();
+  const timeMs = (frame / fps) * 1000;
+
+  // FIX 4 — groupement : 500 ms max entre tokens d'une même page
+  const { captions } = parseSrt({ input: srtContent });
+  const { pages } = createTikTokStyleCaptions({
+    captions,
+    combineTokensWithinMilliseconds: 500,
+  });
+
+  const currentPage =
+    pages.find(
+      (p) => timeMs >= p.startMs && timeMs < p.startMs + p.durationMs
+    ) ?? null;
+
+  if (!currentPage || currentPage.tokens.length === 0) return null;
+
+  // FIX 1 — taille de police basée sur la hauteur, pas la largeur
+  const fontSize = Math.round(height * 0.055);
+  const outlineWidth = Math.round(fontSize * 0.07);
+
+  // FIX 3 — highlight sur le token actuellement prononcé
+  const activeTokenIndex = currentPage.tokens.findIndex(
+    (token) => timeMs >= token.fromMs && timeMs < token.toMs
+  );
+  const strongIndex =
+    activeTokenIndex >= 0
+      ? activeTokenIndex
+      : currentPage.tokens.length - 1;
+
+  return (
+    <AbsoluteFill>
+      {/* FIX 2 — position : top 38% au lieu du bas */}
+      <div
+        style={{
+          position: "absolute",
+          top: height * 0.38,
+          left: 0,
+          right: 0,
+          display: "flex",
+          justifyContent: "center",
+          paddingLeft: 12,
+          paddingRight: 12,
+        }}
+      >
+        <div
+          style={{
+            fontFamily: FONTS.impact,
+            fontSize,
+            fontWeight: "normal",
+            textAlign: "center",
+            lineHeight: 1.1,
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+          }}
+        >
+          {currentPage.tokens.map((token, i) => (
+            <span key={i}>
+              {i > 0 ? " " : ""}
+              <span
+                style={
+                  i === strongIndex
+                    ? {
+                        color: COLORS.red,
+                        WebkitTextStroke: `${outlineWidth}px rgba(100,0,0,0.7)`,
+                      }
+                    : {
+                        color: COLORS.white,
+                        WebkitTextStroke: `${outlineWidth}px ${COLORS.black}`,
+                      }
+                }
+              >
+                {token.text.toUpperCase()}
+              </span>
+            </span>
+          ))}
+        </div>
+      </div>
+    </AbsoluteFill>
+  );
+};
+```
+
+### `remotion/src/TwitchClip/TitleOverlay.tsx`
+
+```tsx
+import { AbsoluteFill } from "remotion";
+import type { FC } from "react";
+import { COLORS, FONTS } from "./styles";
+
+interface Props {
+  title: string;
+  width: number;
+  height: number;
+}
+
+export const TitleOverlay: FC<Props> = ({ title, width, height }) => {
+  if (!title) return null;
+
+  const fontSize = Math.round(width * 0.072);
+
+  return (
+    <AbsoluteFill
+      style={{
+        justifyContent: "flex-start",
+        alignItems: "center",
+        paddingTop: Math.round(height * 0.02),
+        paddingLeft: 16,
+        paddingRight: 16,
+      }}
+    >
+      <div
+        style={{
+          backgroundColor: COLORS.titleBg,
+          borderRadius: 16,
+          paddingTop: 8,
+          paddingBottom: 8,
+          paddingLeft: 20,
+          paddingRight: 20,
+          fontFamily: FONTS.impact,
+          fontSize,
+          fontWeight: "normal",
+          color: COLORS.titleText,
+          textAlign: "center",
+          textTransform: "uppercase",
+          letterSpacing: "0.02em",
+          maxWidth: "92%",
+          lineHeight: 1.15,
+        }}
+      >
+        {title}
+      </div>
+    </AbsoluteFill>
+  );
+};
+```
+
+### `remotion/src/TwitchClip/styles.ts`
+
+```typescript
+export const COLORS = {
+  white: "#FFFFFF",
+  black: "#000000",
+  red: "#E8003C",
+  titleBg: "rgba(255, 255, 255, 0.92)",
+  titleText: "#000000",
+} as const;
+
+export const FONTS = {
+  impact: 'Impact, "Arial Narrow", Arial, sans-serif',
+} as const;
+
+const GRADE_FILTERS: Record<string, string> = {
+  viral: "saturate(1.3) contrast(1.1) brightness(1.03)",
+  cinematic: "saturate(0.85) contrast(1.05)",
+  raw: "none",
+};
+
+export function colorGradeFilter(grade: string): string {
+  return GRADE_FILTERS[grade] ?? "none";
+}
+```
+
 ### `config/settings.yaml`
 
 ```yaml
@@ -2292,11 +2555,7 @@ def edit(
 
 - `src/editor/ffmpeg_preprocessor.py`
 - `src/editor/whisper_transcriber.py`
-- `remotion/src/TwitchClip/index.tsx`
-- `remotion/src/TwitchClip/CaptionOverlay.tsx`
-- `remotion/src/TwitchClip/TitleOverlay.tsx`
-- `remotion/src/TwitchClip/styles.ts`
 - `remotion/render.mjs`
 
 ---
-_14 fichier(s) inclus — 7 non trouvé(s)_
+_18 fichier(s) inclus — 3 non trouvé(s)_
